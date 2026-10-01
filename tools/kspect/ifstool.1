@@ -1,0 +1,87 @@
+.TH IFSTOOL 1 "March 2026" "Linux" "User Commands"
+.SH NAME
+ifstool \- Analyze kernel interference statistics (CONFIG_CGROUP_IFS)
+.SH SYNOPSIS
+.B ifstool monitor
+[\fB\-G\fR|\fB\-\-cgroup\fR \fICGROUP_ID\fR] [\fB\-d\fR|\fB\-\-duration\fR \fISEC\fR] [\fB\-i\fR|\fB\-\-interval\fR \fISEC\fR] [\fB\-o\fR|\fB\-\-output\fR \fICSV\fR]
+.br
+.B ifstool report
+[\fB\-b\fR|\fB\-\-base\fR \fICSV\fR] [\fB\-c\fR|\fB\-\-curr\fR \fICSV\fR] [\fB\-o\fR|\fB\-\-output\fR \fIHTML\fR]
+
+.SH DESCRIPTION
+.B IFSTOOL
+is a specialized userspace utility designed to facilitate the monitoring and analysis of Interference Statistics (\fBCONFIG_CGROUP_IFS\fR).
+
+The \fBIFS infrastructure\fR is a kernel-level framework providing critical observability into execution jitter (noise) that disrupts task determinism. It quantifies CPU time stolen by kernel activities such as interrupt handling, softirqs, and lock contention. This telemetry is exposed via the \fBinterference.stat\fR control file within the cgroup hierarchy.
+
+\fBIFSTOOL\fR interfaces with this file to export raw metrics into structured CSV data and interactive HTML-based distribution reports.
+
+.SH SETUP
+The host environment must meet the following criteria:
+.IP \[bu] 2
+\fBKernel:\fR Compiled with \fBCONFIG_CGROUP_IFS=y\fR.
+.IP \[bu] 2
+\fBBoot Parameters:\fR \fBcgroup_ifs=1\fR added to the kernel command line (optional, not needed if \fBCONFIG_CGROUP_IFS_DEFAULT_ENABLED=y\fR).
+.IP \[bu] 2
+\fBPython Runtime:\fR Python 3.x with \fBpandas\fR and \fBplotly\fR libraries.
+.IP \[bu] 2
+\fBCgroup Hierarchy:\fR Either v2 unified or v1 (with the \fBcpu\fR subsystem mounted).
+
+.SH COMMANDS
+.SS monitor
+Capture raw interference data from a target cgroup.
+.TP
+\fB\-G, \-\-cgroup\fR \fICGROUP_ID\fR
+Specify the cgroup identifier (e.g., \fIdocker/<cid>\fR). For example, /sys/kernel/cgroup/A/B/C, when you want to monitor level B, the cgroup_id is A/B. Tip: Find this via cat \fI/proc/PID/cgroup\fR.
+.TP
+\fB\-d, \-\-duration\fR \fISEC\fR
+Total collection time in seconds (default: 30).
+.TP
+\fB\-i, \-\-interval\fR \fISEC\fR
+Sampling interval in seconds; supports floating point (default: 1.0).
+.TP
+\fB\-o, \-\-output\fR \fICSV\fR
+Path to the output CSV file where raw sampled data will be stored (default: \fBcapture.csv\fR).
+
+.SS report
+Transform captured CSV data into an interactive HTML dashboard.
+.TP
+\fB\-b, \-\-base\fR \fICSV\fR
+Primary capture file for analysis.
+.TP
+\fB\-c, \-\-curr\fR \fICSV\fR
+Optional secondary file for differential (comparison) analysis.
+.TP
+\fB\-o, \-\-output\fR \fIHTML\fR
+Path to the generated interactive HTML dashboard (default: \fBreport.html\fR).
+
+.SH HTML REPORT STRUCTURE
+The generated HTML report provides a multi-dimensional view of kernel noise:
+.IP "Total Time Delta Trend" 4
+A time-series line chart illustrating the incremental nanoseconds of interference per category (e.g., irq, spinlock).
+.IP "Latency Heatmaps" 4
+A frequency-domain visualization of the kernel's internal histogram:
+.RS 8
+.IP "X-axis:" 8
+Wall-clock time of the trace.
+.IP "Y-axis:" 8
+Latency magnitude (logarithmic buckets from ns to s).
+.IP "Color Intensity:" 8
+Represents the event count (density) of interference within that specific latency window.
+.RE
+
+.SH EXAMPLES
+Monitor a Docker container for 10 seconds:
+.IP
+.B $ ifstool monitor \-\-cgroup docker/<cid> \-\-duration 10 \-\-interval 1
+.PP
+Generate a single-session deep dive:
+.IP
+.B $ ifstool report \-\-base capture.csv
+.PP
+Generate a differential report between two traces:
+.IP
+.B $ ifstool report \-\-base baseline.csv \-\-curr current.csv
+
+.SH AUTHOR
+Tengda Wu <wutengda2@huawei.com>

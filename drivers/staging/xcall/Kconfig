@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0
+menu "Xcall"
+
+if ARM64
+
+config DYNAMIC_XCALL_TESTCASE
+	tristate "xcall2.0 test case"
+	depends on DYNAMIC_XCALL
+	help
+	  A simple example of using the xcall2.0 kernel module.
+	  This module can be combined with the syscall sub-item of
+	  Unixbench to evaluate the baseline noise of xcall2.0's
+	  "Dynamic Instruction Replacement" mechanism. Users can
+	  also use this module as a reference to implement custom
+	  system calls.
+
+endif # if ARM64
+
+endmenu

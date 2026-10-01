@@ -1,0 +1,31 @@
+config UDFI
+	bool "UDFI Drivers"
+	depends on ARM64
+	default n
+	help
+	  UBIOS Distributed Firmware Interface (UDFI) support for kernel
+	  requires a UBIOS platform. UDFI provides communication channels
+	  among OS, BIOS and other firmware:
+	  (1) Call ID Service (CIS), by which OS sends a call to BIOS, can be used
+	  to operate specific hardware, read/write BIOS information or call BIOS
+	  functions , e.g., read/write RTC, modify boot options, etc.
+	  (2) Notify ID Information (NII), by which OS receives notification from
+	  BIOS, provides notification mechanism from BIOS to OS. This is useful
+	  when events detected and BIOS needs to inform OS, e.g., RAS events.
+
+if UDFI
+
+config UDFI_CIS
+	tristate "CIS framework"
+	select UDFI_ODF
+	default n
+	help
+	  This option is selected if CIS framework is needed.
+
+config UDFI_ODF
+	tristate "odf parse"
+	default n
+	help
+	  This driver support UBIOS object description specification parse
+
+endif # UDFI

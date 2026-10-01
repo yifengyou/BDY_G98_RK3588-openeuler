@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2021-2025. All rights reserved.
+ *
+ * Description: ubcore kernel module
+ * Author: Qian Guoxin
+ * Create: 2021-08-03
+ * Note:
+ * History: 2021-08-03: create file
+ */
+
+#include <linux/module.h>
+#include <linux/limits.h>
+#include "ubcore_main.h"
+#include "ubcore_log.h"
+#include "ubcore_workqueue.h"
+#include "ubcore_device.h"
+#include "ubcore_priv.h"
+#include "net/ubcore_comm.h"
+#include "net/ubcore_session.h"
+#include "ubcore_connect_adapter.h"
+#include "ubcore_genl.h"
+#include "ubcore_topo_info.h"
+#include "ubcm/ub_cm.h"
+#include "ubmgr/ubmgr.h"
+
+#include "ub/urma/ubcore_perf.h"
+
+#define UBCORE_LOG_FILE_PERMISSION (0644)
+
+module_param(g_ubcore_log_level, uint, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(g_ubcore_log_level, " 3: ERR, 4: WARNING, 6: INFO, 7: DEBUG");
+static int ubcore_ratelimit_burst_set(const char *val,
+				      const struct kernel_param *kp)
+{
+	unsigned int num;
+	int ret;
+
+	/* param_set_uint_minmax() is introduced in v5.14; fall back to the
+	 * generic param_set_uint() with a manual range check so we stay
+	 * compatible with older kernels. burst is later stored into an int
+	 * field of ratelimit_state, so cap the uint to S32_MAX to keep the
+	 * int conversion non-negative.
+	 */
+	ret = kstrtouint(val, 0, &num);
+	if (ret != 0)
+		return ret;
+	if (num > S32_MAX)
+		return -EINVAL;
+
+	return param_set_uint(val, kp);
+}
+
+static const struct kernel_param_ops ubcore_ratelimit_burst_ops = {
+	.set = ubcore_ratelimit_burst_set,
+	.get = param_get_uint,
+};
+
+module_param_cb(ubcore_ratelimit_burst, &ubcore_ratelimit_burst_ops,
+		&ubcore_ratelimit_burst, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(ubcore_ratelimit_burst, "ratelimit burst for _rl logs (default: 10)");
+module_param(ubcore_conn_timeout, uint, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(ubcore_conn_timeout, "unit milliseconds");
+module_param(ubcore_enable_shared_ctp, bool, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(ubcore_enable_shared_ctp, "enable shared-CTP, 0: off, 1: on (default: 0)");
+module_param(ubcore_max_retry_cnt, uint, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(ubcore_max_retry_cnt, "maximum retry count for wk-jetty (default: 11)");
+module_param(ubmad_retry_interval_ms, uint, UBCORE_LOG_FILE_PERMISSION);
+MODULE_PARM_DESC(ubmad_retry_interval_ms, "retransmission interval in ms for ubmad (default: 5000)");
+
+static int __init ubcore_init(void)
+{
+	int ret;
+
+	ubcore_exchange_init();
+
+	ret = ubcore_perf_init();
+	if (ret != 0) {
+		ubcore_log_err("Failed to init ubcore perf, ret = %d.\n", ret);
+		return ret;
+	}
+	ret = ubcore_class_register();
+	if (ret != 0)
+		goto ubperf;
+
+	ret = ubcore_cdev_register();
+	if (ret != 0)
+		goto class_init;
+
+	ret = ubcore_genl_init();
+	if (ret != 0) {
+		(void)pr_err("Failed to ubcore genl init\n");
+		goto genl_init;
+	}
+
+	ret = ubcore_register_pnet_ops();
+	if (ret != 0)
+		goto reg_pnet;
+
+	ret = ubcore_create_workqueues();
+	if (ret != 0) {
+		ubcore_log_err("Failed to create all the workqueues, ret = %d\n", ret);
+		goto create_wq;
+	}
+
+	if (ubcore_session_init() != 0) {
+		ubcore_log_err("Failed init connect alpha");
+		goto session;
+	}
+
+	ret = ubcm_init();
+	if (ret != 0) {
+		pr_err("Failed to init ubcm, ret: %d.\n", ret);
+		goto ubcm;
+	}
+
+	ret = ubmgr_init();
+	if (ret != 0) {
+		pr_err("Failed to init ubmgr, ret: %d.\n", ret);
+		goto ubmgr;
+	}
+
+	ubcore_log_info("ubcore module init success.\n");
+	return 0;
+
+ubmgr:
+	ubcm_uninit();
+ubcm:
+	ubcore_session_uninit();
+session:
+	ubcore_destroy_workqueues();
+create_wq:
+	ubcore_unregister_pnet_ops();
+reg_pnet:
+	ubcore_genl_exit();
+genl_init:
+	ubcore_cdev_unregister();
+class_init:
+	ubcore_class_unregister();
+ubperf:
+	ubcore_perf_uninit();
+	return ret;
+}
+
+static void __exit ubcore_exit(void)
+{
+	ubcm_uninit();
+	ubcore_unregister_comm_msg_handler(1);
+	ubcore_comm_uninit();
+	ubcore_session_uninit();
+	ubcore_destroy_workqueues();
+	ubcore_unregister_pnet_ops();
+	ubcore_genl_exit();
+	ubcore_cdev_unregister();
+	ubcore_class_unregister();
+	ubcore_perf_uninit();
+	ubcore_log_info("ubcore module exits.\n");
+}
+
+module_init(ubcore_init);
+module_exit(ubcore_exit);
+
+MODULE_DESCRIPTION("URMA memory semantic kernel module for direct remote memory access.");
+MODULE_AUTHOR("huawei");
+MODULE_LICENSE("GPL");

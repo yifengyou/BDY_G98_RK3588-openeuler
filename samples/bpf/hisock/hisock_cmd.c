@@ -1,0 +1,481 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ *
+ * Description: End-to-End HiSock Redirect sample.
+ */
+#include <linux/bpf.h>
+#include <linux/if_link.h>
+#include <assert.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <libgen.h>
+#include <limits.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <net/if.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include "bpf_util.h"
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN	16
+#endif
+
+#define HISOCK_BPFFS	"/sys/fs/bpf/hisock"
+#define DEF_BPF_PATH	"bpf.o"
+#define MAX_IF_NUM	8
+#define MAX_PORT_NUM	8
+#define MAX_COMM_NUM	8
+
+struct {
+	__u32 ifindex[MAX_IF_NUM];
+	int if_num;
+	char *port[MAX_PORT_NUM];
+	int port_num;
+	char *comm[MAX_COMM_NUM];
+	int comm_num;
+	char *cgrp_path;
+	char *bpf_path;
+	bool unload;
+} hisock;
+
+struct hisock_prog_info {
+	const char *prog_name;
+	const char *pin_map;
+	enum bpf_prog_type prog_type;
+	enum bpf_attach_type attach_type;
+	bool is_dev_attach;
+	bool is_skmsg;
+	int prog_fd;
+};
+
+static struct hisock_prog_info prog_infos[] = {
+	{
+		.prog_name	= "hisock_sockops_prog",
+		.prog_type	= BPF_PROG_TYPE_SOCK_OPS,
+		.attach_type	= BPF_CGROUP_SOCK_OPS,
+	},
+	{
+		.prog_name      = "hisock_skmsg_prog",
+		.prog_type      = BPF_PROG_TYPE_SK_MSG,
+		.attach_type    = BPF_SK_MSG_VERDICT,
+		.pin_map	= "local_connmap",
+		.is_skmsg	= true,
+	},
+	{
+		.prog_name	= "hisock_ingress_prog",
+		.prog_type	= BPF_PROG_TYPE_HISOCK,
+		.attach_type	= BPF_HISOCK_INGRESS,
+		.is_dev_attach	= true,
+	},
+	{
+		.prog_name	= "hisock_egress_prog",
+		.prog_type	= BPF_PROG_TYPE_HISOCK,
+		.attach_type	= BPF_HISOCK_EGRESS,
+	},
+};
+
+static int set_prog_type(struct bpf_object *obj)
+{
+	enum bpf_attach_type attach_type;
+	enum bpf_prog_type prog_type;
+	struct bpf_program *prog;
+	const char *prog_name;
+	int i;
+
+	bpf_object__for_each_program(prog, obj) {
+		prog_name = bpf_program__name(prog);
+		for (i = 0; i < ARRAY_SIZE(prog_infos); i++) {
+			if (!strcmp(prog_infos[i].prog_name, prog_name)) {
+				prog_type = prog_infos[i].prog_type;
+				attach_type = prog_infos[i].attach_type;
+				break;
+			}
+		}
+
+		if (i == ARRAY_SIZE(prog_infos))
+			return -1;
+
+		bpf_program__set_type(prog, prog_type);
+		bpf_program__set_expected_attach_type(prog, attach_type);
+	}
+
+	return 0;
+}
+
+static int find_progs(struct bpf_object *obj)
+{
+	struct hisock_prog_info *info;
+	struct bpf_program *prog;
+	int i, prog_fd;
+
+	for (i = 0; i < ARRAY_SIZE(prog_infos); i++) {
+		info = &prog_infos[i];
+		prog = bpf_object__find_program_by_name(obj, info->prog_name);
+		if (!prog) {
+			fprintf(stderr, "ERROR: failed to find prog sec %s\n", info->prog_name);
+			return -1;
+		}
+
+		prog_fd = bpf_program__fd(prog);
+		if (prog_fd < 0) {
+			fprintf(stderr, "ERROR: failed to get fd of prog %s\n", info->prog_name);
+			return -1;
+		}
+
+		info->prog_fd = prog_fd;
+	}
+
+	return 0;
+}
+
+static int parse_port_range(const char *port_str, int map_fd)
+{
+	char *str = strdup(port_str);
+	char *token, *rest = str;
+	__u8 val = 1;
+	__u16 port;
+
+	while ((token = strtok_r(rest, ",", &rest))) {
+		char *dash = strchr(token, '-');
+
+		if (dash) {
+			*dash = '\0';
+			__u16 start = atoi(token);
+			__u16 end = atoi(dash + 1);
+
+			if (start > end || start == 0 || end > 65535) {
+				fprintf(stderr, "Invalid port range: %s\n", token);
+				return -1;
+			}
+
+			for (port = start; port <= end; port++) {
+				if (bpf_map_update_elem(map_fd, &port, &val, BPF_ANY) < 0) {
+					fprintf(stderr, "ERROR: failed to update port range\n");
+					return -1;
+				}
+			}
+
+			printf("Speed port range: %u-%u\n", start, end);
+		} else {
+			port = atoi(token);
+			if (port == 0 || port > 65535) {
+				fprintf(stderr, "Invalid port: %s\n", token);
+				return -1;
+			}
+
+			if (bpf_map_update_elem(map_fd, &port, &val, BPF_ANY) < 0) {
+				fprintf(stderr, "ERROR: failed to update port\n");
+				return -1;
+			}
+
+			printf("Speed port: %u\n", port);
+		}
+	}
+
+	free(str);
+	return 0;
+}
+
+static int set_speed_port(struct bpf_object *obj)
+{
+	int map_fd, i;
+
+	map_fd = bpf_object__find_map_fd_by_name(obj, "speed_port");
+	if (map_fd < 0) {
+		fprintf(stderr, "ERROR: failed to find map fd\n");
+		return -1;
+	}
+
+	for (i = 0; i < hisock.port_num; i++) {
+		if (hisock.port[i] && parse_port_range(hisock.port[i], map_fd)) {
+			fprintf(stderr, "ERROR: failed to update port\n");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int set_target_comm(struct bpf_object *obj)
+{
+	int map_fd, i;
+
+	map_fd = bpf_object__find_map_fd_by_name(obj, "target_comm");
+	if (map_fd < 0) {
+		fprintf(stderr, "ERROR: failed to find map fd\n");
+		return -1;
+	}
+
+	for (i = 0; i < hisock.comm_num; i++) {
+		char key[TASK_COMM_LEN] = { 0 };
+		__u8 val = 1;
+
+		strncpy(key, hisock.comm[i], sizeof(key) - 1);
+		if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) < 0) {
+			fprintf(stderr, "ERROR: failed to update comm\n");
+			return -1;
+		}
+		printf("Target comm: %s\n", key);
+	}
+
+	return 0;
+}
+
+static int detach_progs(void)
+{
+	struct hisock_prog_info *info;
+	int i, j, cgrp_fd;
+	int err_cnt = 0;
+
+	cgrp_fd = open(hisock.cgrp_path, O_DIRECTORY, O_RDONLY);
+	if (cgrp_fd < 0) {
+		fprintf(stderr, "ERROR: failed to open cgrp %s\n", hisock.cgrp_path);
+		return -1;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(prog_infos); i++) {
+		info = &prog_infos[i];
+		if (info->is_dev_attach) {
+			for (j = 0; j < hisock.if_num; j++) {
+				if (bpf_prog_detach(hisock.ifindex[j], info->attach_type)) {
+					fprintf(stderr,
+						"ERROR: failed to detach prog %s\n",
+						info->prog_name);
+					err_cnt++;
+				}
+			}
+			continue;
+		}
+
+		if (info->is_skmsg) {
+			char pin_path[64];
+
+			snprintf(pin_path, sizeof(pin_path), "%s/%s",
+				 HISOCK_BPFFS, info->pin_map);
+
+			unlink(pin_path);
+			continue;
+		}
+
+		if (bpf_prog_detach(cgrp_fd, info->attach_type)) {
+			fprintf(stderr, "ERROR: failed to detach prog %s\n", info->prog_name);
+			err_cnt++;
+		}
+	}
+
+	close(cgrp_fd);
+	return -err_cnt;
+}
+
+static int attach_progs(struct bpf_object *obj)
+{
+	struct hisock_prog_info *info;
+	int i, j, cgrp_fd;
+
+	cgrp_fd = open(hisock.cgrp_path, O_DIRECTORY, O_RDONLY);
+	if (cgrp_fd < 0) {
+		fprintf(stderr, "ERROR: failed to open cgrp %s\n", hisock.cgrp_path);
+		return -1;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(prog_infos); i++) {
+		info = &prog_infos[i];
+		if (info->is_dev_attach) {
+			for (j = 0; j < hisock.if_num; j++) {
+				if (bpf_prog_attach(info->prog_fd, hisock.ifindex[j],
+						    info->attach_type, 0))
+					goto fail;
+			}
+			continue;
+		}
+
+		if (info->is_skmsg) {
+			struct bpf_map *map;
+			char pin_path[64];
+
+			map = bpf_object__find_map_by_name(obj, info->pin_map);
+			if (!map) {
+				fprintf(stderr, "ERROR: failed to find pin map\n");
+				goto fail;
+			}
+
+			snprintf(pin_path, sizeof(pin_path), "%s/%s",
+				 HISOCK_BPFFS, info->pin_map);
+
+			if (bpf_map__pin(map, pin_path)) {
+				fprintf(stderr, "ERROR: failed to pin map\n");
+				goto fail;
+			}
+
+			if (bpf_prog_attach(info->prog_fd, bpf_map__fd(map),
+					    info->attach_type, 0))
+				goto fail;
+
+			continue;
+		}
+
+		if (bpf_prog_attach(info->prog_fd, cgrp_fd, info->attach_type, 0))
+			goto fail;
+	}
+
+	close(cgrp_fd);
+	return 0;
+fail:
+	fprintf(stderr, "ERROR: failed to attach prog %s\n", info->prog_name);
+	close(cgrp_fd);
+	detach_progs();
+	return -1;
+}
+
+static int do_hisock(void)
+{
+	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
+	struct bpf_object *obj;
+
+	setrlimit(RLIMIT_MEMLOCK, &r);
+
+	obj = bpf_object__open(hisock.bpf_path);
+	if (libbpf_get_error(obj)) {
+		fprintf(stderr, "ERROR: failed to open bpf file\n");
+		return -1;
+	}
+
+	if (set_prog_type(obj)) {
+		fprintf(stderr, "ERROR: failed to set prog type\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	if (bpf_object__load(obj)) {
+		fprintf(stderr, "ERROR: failed to load bpf obj\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	if (find_progs(obj)) {
+		fprintf(stderr, "ERROR: failed to find progs\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	if (set_speed_port(obj)) {
+		fprintf(stderr, "ERROR: failed to set speed port\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	if (set_target_comm(obj)) {
+		fprintf(stderr, "ERROR: failed to set target comm\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	if (attach_progs(obj)) {
+		fprintf(stderr, "ERROR: failed to attach progs\n");
+		bpf_object__close(obj);
+		return -1;
+	}
+
+	bpf_object__close(obj);
+	return 0;
+}
+
+static void do_help(void)
+{
+	fprintf(stderr,
+		"Load:   hisock_cmd [-f BPF_FILE] [-c CGRP_PATH] "
+		"[-p PORT] [-C COMM] [-i INTERFACE]\n"
+		"Unload: hisock_cmd -u [-c CGRP_PATH] [-i INTERFACE]\n");
+}
+
+static int parse_args(int argc, char **argv)
+{
+	int opt;
+
+	hisock.bpf_path = DEF_BPF_PATH;
+
+	while ((opt = getopt(argc, argv, "f:c:p:i:C:uh")) != -1) {
+		switch (opt) {
+		case 'f':
+			hisock.bpf_path = optarg;
+			break;
+		case 'c':
+			hisock.cgrp_path = optarg;
+			break;
+		case 'p':
+			hisock.port[hisock.port_num] = optarg;
+			hisock.port_num++;
+			break;
+		case 'i':
+			hisock.ifindex[hisock.if_num] = if_nametoindex(optarg);
+			hisock.if_num++;
+			break;
+		case 'C':
+			hisock.comm[hisock.comm_num] = optarg;
+			hisock.comm_num++;
+			break;
+		case 'u':
+			hisock.unload = true;
+			break;
+		case 'h':
+			do_help();
+			exit(0);
+		default:
+			fprintf(stderr, "ERROR: unknown option %c\n", opt);
+			return -1;
+		}
+	}
+
+	if (hisock.unload &&
+	    (hisock.cgrp_path == NULL || hisock.if_num == 0)) {
+		do_help();
+		return -1;
+	}
+
+	if (!hisock.unload &&
+	    (hisock.cgrp_path == NULL || hisock.if_num == 0 ||
+	     (hisock.port_num == 0 && hisock.comm_num == 0))) {
+		do_help();
+		return -1;
+	}
+
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	if (parse_args(argc, argv)) {
+		fprintf(stderr, "ERROR: failed to parse args\n");
+		return -1;
+	}
+
+	if (hisock.unload) {
+		if (detach_progs()) {
+			fprintf(stderr, "ERROR: failed to detach progs\n");
+			return -1;
+		}
+
+		printf("Unload HiSock successfully\n");
+		return 0;
+	}
+
+	if (do_hisock()) {
+		fprintf(stderr, "ERROR: failed to do hisock\n");
+		return -1;
+	}
+
+	printf("Load HiSock successfully\n");
+	return 0;
+}

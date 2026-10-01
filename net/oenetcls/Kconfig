@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config OENETCLS
+	tristate "Network classification"
+	depends on MODULES && m
+	default n
+	help
+	  This introduces a kind of network optimization method, which can
+	  configure the flow steer rules, and bind interrupt to the netdev
+	  queue automatically.
+
+	  This module can only be built as a loadable module.

@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: GPL-2.0-only
+menu "Turbo features selection"
+
+config FAST_SYSCALL
+	bool "Fast syscall handler support"
+	default n
+	help
+	  This enable support Fast syscall feature.
+	  The svc exception handling process, which includes auxiliary
+	  functions for debug/trace and core functions like
+	  KPTI, has been identified as overly "lengthy".
+	  This inefficiency is particularly noticeable in short syscalls
+	  such as lseek() and getpid(), where the syscall function itself
+	  comprises a small percentage of the total instructions executed.
+	  To address this, we introduce the concept of fast syscall, a fast svc
+	  exception handling path that only considers necessary features
+	  such as security, context saving, and recovery.
+
+config FAST_IRQ
+	bool "Fast irq handler support"
+	depends on ARM_GIC_V3
+	default n
+	help
+	  The irq handling process, which includes auxiliary
+	  functions for debug/trace and core functions like
+	  KPTI, interrupt time record, interrupt processing as
+	  a random number source, interrupt affinity
+	  modification and interrupt processing race, as well as
+	  spurious and unhandled interrupt debugging, has been
+	  identified as overly "lengthy".
+	  To address this, we introduce the concept of fast irq,
+	  a fast interrupt handling path that only considers
+	  necessary features such as security, context saving
+	  and recovery, which adds an lightweight interrupt processing
+	  framework for latency-sensitive interrupts.
+
+config DEBUG_FEATURE_BYPASS
+	bool "Bypass debug feature in fast syscall"
+	depends on FAST_SYSCALL || FAST_IRQ
+	depends on !LOCKDEP
+	default n
+	help
+	  This to bypass debug feature in fast syscall.
+	  The svc exception handling process, which includes auxiliary
+	  functions for debug/trace and core functions like
+	  KPTI, has been identified as overly "lengthy".
+	  In fast syscall we only considers necessary features.
+	  Disable this config to keep debug feature in fast syscall.
+
+config SECURITY_FEATURE_BYPASS
+	bool "Bypass security feature in fast syscall"
+	depends on !ARM64_MTE
+	depends on !KASAN_HW_TAGS
+	depends on FAST_SYSCALL || FAST_IRQ
+	default n
+	help
+	  This to bypass security feature in fast syscall.
+	  The svc exception handling process, which includes auxiliary
+	  functions for debug/trace and core functions like
+	  KPTI, has been identified as overly "lengthy".
+	  In fast syscall we only considers necessary features.
+	  Disable this config to keep security feature in fast syscall.
+
+config ACTLR_XCALL_XINT
+	bool "Hardware XCALL and Xint support"
+	depends on FAST_SYSCALL
+	default n
+	help
+	  Use the 0x600 as the offset to the exception vector base address for
+	  'svc ffff'
+	  Use the 0x680 as the offset to the exception vector base address for
+	  the Armv8.8 NMI taken from EL0.
+
+config DYNAMIC_XCALL
+	bool "Support dynamically replace and load system call"
+	depends on FAST_SYSCALL
+	depends on UPROBES
+	default n
+	help
+	  Xcall 2.0 add "/proc/xcall/comm" interface to
+	  attach xcall programs onto one executable,
+	  and support different custom syscall implementation
+	  by dynamic instruction replaced with 'svc ffff'
+	  and a kernel module which provides customized
+	  implementation.
+
+config ARM64_COPY_FROM_USER_OPT
+	bool "Hisilicon Optimized Copy From User enabled"
+	depends on ARCH_HISI
+	default y
+	help
+	  Enable an optimized copy_from_user implementation for
+	  supported cores (e.g. Hisilicon HIP11, Hisilicon HIP12,
+	  Linxicore9100). This trades a small PAN toggle overhead
+	  for higher throughput on large copies. This can be
+	  disabled at boot via copy_opt_disable.
+
+config SMT_QOS
+	bool "Support userspace timer/wft to reduce intra-core contention"
+	depends on SCHED_SMT
+	depends on FAST_IRQ
+	depends on QOS_SCHED_DYNAMIC_AFFINITY
+	depends on CFS_BANDWIDTH && CGROUP_SCHED
+	select QOS_LEVEL
+	default y
+	help
+	  Cloud Service Provider deploy Best-Effort and Latency Sensitive tasks
+	  on the same physical core to maximize the resource utilization. We
+	  observe the LS task needs more cycles to complete the same workload
+	  due to the uarch resource contention. This feature control the
+	  instruction throughput of BS task into pipeline, so that the other
+	  SMT running LS task could occupy more uarch resources to reach better
+	  IPC.
+
+config ARM64_VIP_SMT
+	bool "Enable support for VIP-SMT"
+	default y
+	depends on ARM64 && SMP && ARCH_HISI
+	help
+	  VIP-SMT is an ARM64 SMT enhancement feature that allows
+	  configuring VIP (high-priority) threads and non-VIP threads
+	  within the same physical core. It uses hardware registers
+	  to control thread priority and resource allocation.
+
+	  This feature requires hardware support for SMT QoS mode.
+	  When enabled, sysfs interfaces are created under
+	  /sys/devices/system/cpu/regs/vip-smt to configure VIP-SMT settings.
+
+	  Say N if you want to disable this feature.
+
+endmenu # "Turbo features selection"

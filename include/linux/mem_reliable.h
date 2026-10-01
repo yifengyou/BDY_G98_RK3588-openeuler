@@ -1,0 +1,283 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef __MM_MEM_RELIABLE__
+#define __MM_MEM_RELIABLE__
+
+#ifdef CONFIG_MEMORY_RELIABLE
+
+#include <linux/stddef.h>
+#include <linux/gfp.h>
+#include <linux/mmzone.h>
+#include <linux/oom.h>
+#include <linux/mm_types.h>
+#include <linux/sched.h>
+#include <linux/percpu_counter.h>
+
+DECLARE_STATIC_KEY_FALSE(mem_reliable);
+
+extern bool reliable_enabled;
+extern struct file_operations proc_reliable_operations;
+extern bool shmem_reliable;
+extern bool reliable_allow_fallback;
+extern bool pagecache_reliable;
+extern struct percpu_counter pagecache_reliable_pages;
+extern struct percpu_counter anon_reliable_pages;
+extern struct percpu_counter shmem_reliable_pages;
+extern unsigned long task_reliable_limit __read_mostly;
+extern unsigned long shmem_reliable_limit __read_mostly;
+extern unsigned long pagecache_reliable_limit __read_mostly;
+
+void mem_reliable_init(bool has_unmirrored_mem, unsigned long mirrored_sz);
+bool mem_reliable_status(void);
+bool mem_reliable_hide_file(const char *name);
+void shmem_reliable_init(void);
+void reliable_lru_add(enum lru_list lru, struct folio *folio, int val);
+void reliable_lru_add_batch(int zid, enum lru_list lru, int val);
+bool mem_reliable_counter_initialized(void);
+void reliable_report_meminfo(struct seq_file *m);
+void mem_reliable_out_of_memory(gfp_t gfp_mask, unsigned int order,
+				int preferred_nid, nodemask_t *nodemask);
+
+static inline bool mem_reliable_is_enabled(void)
+{
+	return static_branch_likely(&mem_reliable);
+}
+
+static inline bool page_reliable(struct page *page)
+{
+	if (!mem_reliable_is_enabled())
+		return false;
+
+	if (!page)
+		return false;
+
+	if (PagePool(page))
+		return false;
+
+	return page_zonenum(page) < ZONE_MOVABLE;
+}
+
+static inline bool folio_reliable(struct folio *folio)
+{
+	if (!mem_reliable_is_enabled())
+		return false;
+
+	if (!folio)
+		return false;
+
+	if (folio_test_pool(folio))
+		return false;
+
+	return folio_zonenum(folio) < ZONE_MOVABLE;
+}
+
+static inline bool shmem_reliable_is_enabled(void)
+{
+	return shmem_reliable;
+}
+
+static inline bool filemap_reliable_is_enabled(void)
+{
+	return pagecache_reliable;
+}
+
+/*
+ * Is this an ordinary user allocation that memory-reliable routes to
+ * ZONE_MOVABLE (the non-mirrored region)? Such allocations can only
+ * consume pages from ZONE_MOVABLE. Shared by:
+ * - skip_non_mirrored_zone(): skip mirrored zones in the zonelist;
+ * - the reclaim-side filter in isolate_lru_folios(): restrict the LRU
+ *   scan to ZONE_MOVABLE so freed pages are usable by the caller.
+ *
+ * Conditions: reliable enabled, a user task (has mm, not a kthread or
+ * a PF_RELIABLE task), and GFP_HIGHUSER_MOVABLE without __GFP_RELIABLE.
+ * PF_RELIABLE tasks allocate from the reliable region, so they are
+ * excluded even when their gfp happens to be MOVABLE-bound.
+ */
+static inline bool reliable_movable_only_alloc(gfp_t gfp)
+{
+	if (!mem_reliable_is_enabled())
+		return false;
+
+	if (!current->mm || (current->flags & PF_KTHREAD))
+		return false;
+
+	if (current->flags & PF_RELIABLE)
+		return false;
+
+	return !(gfp & GFP_RELIABLE) && (gfp & __GFP_HIGHMEM) &&
+	       (gfp & __GFP_MOVABLE);
+}
+
+static inline bool skip_non_mirrored_zone(gfp_t gfp, struct zoneref *z)
+{
+	/* user tasks can only alloc memory from non-mirrored region */
+	if (reliable_movable_only_alloc(gfp) &&
+	    zonelist_zone_idx(z) < ZONE_MOVABLE)
+		return true;
+
+	return false;
+}
+
+static inline bool reliable_allow_fb_enabled(void)
+{
+	return reliable_allow_fallback;
+}
+
+static inline bool mem_reliable_shmem_limit_check(void)
+{
+	return percpu_counter_read_positive(&shmem_reliable_pages) <
+	       (shmem_reliable_limit >> PAGE_SHIFT);
+}
+
+/*
+ * Check if this memory allocation for shmem is allowed.
+ * Return false if limit is triggered.
+ */
+static inline bool shmem_prepare_alloc(gfp_t *gfp_mask)
+{
+	if (!mem_reliable_is_enabled())
+		return true;
+
+	if (!shmem_reliable_is_enabled()) {
+		*gfp_mask &= ~GFP_RELIABLE;
+		return true;
+	}
+
+	if (mem_reliable_shmem_limit_check()) {
+		*gfp_mask |= GFP_RELIABLE;
+		return true;
+	}
+
+	if (reliable_allow_fb_enabled())
+		return true;
+
+	return false;
+}
+
+static inline void filemap_prepare_alloc(gfp_t *gfp_mask)
+{
+	s64 nr_reliable = 0;
+
+	if (!mem_reliable_is_enabled())
+		return;
+
+	if (!filemap_reliable_is_enabled()) {
+		*gfp_mask &= ~GFP_RELIABLE;
+		return;
+	}
+
+	nr_reliable = percpu_counter_read_positive(&pagecache_reliable_pages);
+	if (nr_reliable > pagecache_reliable_limit >> PAGE_SHIFT) {
+		*gfp_mask &= ~GFP_RELIABLE;
+		return;
+	}
+
+	*gfp_mask |= GFP_RELIABLE;
+}
+
+static inline unsigned long task_reliable_used_pages(void)
+{
+	s64 nr_pages;
+
+	nr_pages = percpu_counter_read_positive(&pagecache_reliable_pages);
+	nr_pages += percpu_counter_read_positive(&anon_reliable_pages);
+
+	return nr_pages;
+}
+
+static inline void shmem_reliable_folio_add(struct folio *folio, int nr_page)
+{
+	if (shmem_reliable_is_enabled() && folio_reliable(folio))
+		percpu_counter_add(&shmem_reliable_pages, nr_page);
+}
+
+static inline bool reliable_mem_limit_check(unsigned long nr_page)
+{
+	s64 nr_task_pages;
+
+	/* limit check need precise counter, use sum rather than read */
+	nr_task_pages = percpu_counter_sum_positive(&pagecache_reliable_pages);
+	nr_task_pages += percpu_counter_sum_positive(&anon_reliable_pages);
+
+	return (nr_task_pages + nr_page) <= (task_reliable_limit >> PAGE_SHIFT);
+}
+
+static inline bool mem_reliable_should_reclaim(void)
+{
+	if (percpu_counter_sum_positive(&pagecache_reliable_pages) >=
+	    MAX_ORDER_NR_PAGES)
+		return true;
+
+	return false;
+}
+
+/*
+ * Is there reclaimable pagecache on ZONE_MOVABLE for a
+ * ZONE_MOVABLE-bound direct reclaim? Returns false once reliable
+ * pagecache fills nearly all of the file LRU (within
+ * MAX_ORDER_NR_PAGES), so the caller can bail out early. Uses
+ * read_positive() for O(1) hot-path cost; the MAX_ORDER_NR_PAGES
+ * margin absorbs the per-CPU drift.
+ */
+static inline bool has_movable_pagecache(void)
+{
+	unsigned long file_total;
+	s64 reliable;
+
+	if (!mem_reliable_is_enabled())
+		return true;
+
+	file_total = global_node_page_state(NR_LRU_BASE +
+					    LRU_ACTIVE_FILE) +
+		    global_node_page_state(NR_LRU_BASE +
+					   LRU_INACTIVE_FILE);
+	reliable = percpu_counter_read_positive(&pagecache_reliable_pages);
+
+	return file_total && reliable + MAX_ORDER_NR_PAGES < file_total;
+}
+
+#else
+#define reliable_enabled 0
+
+static inline bool mem_reliable_is_enabled(void) { return false; }
+static inline bool filemap_reliable_is_enabled(void) { return false; }
+static inline void mem_reliable_init(bool has_unmirrored_mem,
+				     unsigned long mirrored_sz) {}
+static inline bool page_reliable(struct page *page) { return false; }
+static inline bool folio_reliable(struct folio *folio) { return false; }
+static inline bool skip_non_mirrored_zone(gfp_t gfp, struct zoneref *z)
+{
+	return false;
+}
+static inline bool reliable_movable_only_alloc(gfp_t gfp)
+{
+	return false;
+}
+static inline bool mem_reliable_status(void) { return false; }
+static inline bool mem_reliable_hide_file(const char *name) { return false; }
+static inline bool shmem_prepare_alloc(gfp_t *gfp_mask) { return true; }
+static inline void filemap_prepare_alloc(gfp_t *gfp_mask) {}
+static inline void shmem_reliable_init(void) {}
+static inline void reliable_lru_add(enum lru_list lru, struct folio *folio,
+				    int val) {}
+static inline void reliable_lru_add_batch(int zid, enum lru_list lru,
+					  int val) {}
+static inline bool mem_reliable_counter_initialized(void) { return false; }
+static inline void shmem_reliable_folio_add(struct folio *folio,
+					    int nr_page) {}
+static inline void reliable_report_meminfo(struct seq_file *m) {}
+static inline bool mem_reliable_shmem_limit_check(void) { return true; }
+static inline bool reliable_mem_limit_check(unsigned long nr_page)
+{
+	return false;
+}
+static inline bool mem_reliable_should_reclaim(void) { return false; }
+static inline bool has_movable_pagecache(void) { return true; }
+static inline void mem_reliable_out_of_memory(gfp_t gfp_mask,
+					      unsigned int order,
+					      int preferred_nid,
+					      nodemask_t *nodemask) {}
+static inline bool reliable_allow_fb_enabled(void) { return false; }
+#endif
+
+#endif

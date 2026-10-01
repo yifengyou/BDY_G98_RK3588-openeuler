@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ *
+ * Copyright (C) 2013 Citrix Systems
+ *
+ * Author: Stefano Stabellini <stefano.stabellini@eu.citrix.com>
+ */
+
+#define pr_fmt(fmt) "arm-pv: " fmt
+
+#include <linux/arm-smccc.h>
+#include <linux/cpuhotplug.h>
+#include <linux/export.h>
+#include <linux/io.h>
+#include <linux/jump_label.h>
+#include <linux/printk.h>
+#include <linux/psci.h>
+#include <linux/reboot.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/static_call.h>
+
+#include <asm/paravirt.h>
+#include <asm/pvclock-abi.h>
+#include <asm/pvsched-abi.h>
+#ifdef CONFIG_VIRT_VTIMER_PV_STATUS
+#include <asm/pvtimer-status-abi.h>
+#endif
+#include <asm/qspinlock_paravirt.h>
+#include <asm/smp_plat.h>
+
+#define CREATE_TRACE_POINTS
+#include "trace-paravirt.h"
+
+struct static_key paravirt_steal_enabled;
+struct static_key paravirt_steal_rq_enabled;
+
+static u64 native_steal_clock(int cpu)
+{
+	return 0;
+}
+
+DEFINE_STATIC_CALL(pv_steal_clock, native_steal_clock);
+
+struct pv_time_stolen_time_region {
+	struct pvclock_vcpu_stolen_time __rcu *kaddr;
+};
+
+static DEFINE_PER_CPU(struct pv_time_stolen_time_region, stolen_time_region);
+
+static bool steal_acc = true;
+static int __init parse_no_stealacc(char *arg)
+{
+	steal_acc = false;
+	return 0;
+}
+
+early_param("no-steal-acc", parse_no_stealacc);
+
+/* return stolen time in ns by asking the hypervisor */
+static u64 para_steal_clock(int cpu)
+{
+	struct pvclock_vcpu_stolen_time *kaddr = NULL;
+	struct pv_time_stolen_time_region *reg;
+	u64 ret = 0;
+
+	reg = per_cpu_ptr(&stolen_time_region, cpu);
+
+	/*
+	 * paravirt_steal_clock() may be called before the CPU
+	 * online notification callback runs. Until the callback
+	 * has run we just return zero.
+	 */
+	rcu_read_lock();
+	kaddr = rcu_dereference(reg->kaddr);
+	if (!kaddr) {
+		rcu_read_unlock();
+		return 0;
+	}
+
+	ret = le64_to_cpu(READ_ONCE(kaddr->stolen_time));
+	rcu_read_unlock();
+	return ret;
+}
+
+static int stolen_time_cpu_down_prepare(unsigned int cpu)
+{
+	struct pvclock_vcpu_stolen_time *kaddr = NULL;
+	struct pv_time_stolen_time_region *reg;
+
+	reg = this_cpu_ptr(&stolen_time_region);
+	if (!reg->kaddr)
+		return 0;
+
+	kaddr = rcu_replace_pointer(reg->kaddr, NULL, true);
+	synchronize_rcu();
+	memunmap(kaddr);
+
+	return 0;
+}
+
+static int stolen_time_cpu_online(unsigned int cpu)
+{
+	struct pvclock_vcpu_stolen_time *kaddr = NULL;
+	struct pv_time_stolen_time_region *reg;
+	struct arm_smccc_res res;
+
+	reg = this_cpu_ptr(&stolen_time_region);
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_TIME_ST, &res);
+
+	if (res.a0 == SMCCC_RET_NOT_SUPPORTED)
+		return -EINVAL;
+
+	kaddr = memremap(res.a0,
+			      sizeof(struct pvclock_vcpu_stolen_time),
+			      MEMREMAP_WB);
+
+	rcu_assign_pointer(reg->kaddr, kaddr);
+
+	if (!reg->kaddr) {
+		pr_warn("Failed to map stolen time data structure\n");
+		return -ENOMEM;
+	}
+
+	if (le32_to_cpu(kaddr->revision) != 0 ||
+	    le32_to_cpu(kaddr->attributes) != 0) {
+		pr_warn_once("Unexpected revision or attributes in stolen time data\n");
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static int __init pv_time_init_stolen_time(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+				"hypervisor/arm/pvtime:online",
+				stolen_time_cpu_online,
+				stolen_time_cpu_down_prepare);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
+static bool __init has_pv_steal_clock(void)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_ARCH_FEATURES_FUNC_ID,
+			     ARM_SMCCC_HV_PV_TIME_FEATURES, &res);
+
+	if (res.a0 != SMCCC_RET_SUCCESS)
+		return false;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_TIME_FEATURES,
+			     ARM_SMCCC_HV_PV_TIME_ST, &res);
+
+	return (res.a0 == SMCCC_RET_SUCCESS);
+}
+
+int __init pv_time_init(void)
+{
+	int ret;
+
+	if (!has_pv_steal_clock())
+		return 0;
+
+	ret = pv_time_init_stolen_time();
+	if (ret)
+		return ret;
+
+	static_call_update(pv_steal_clock, para_steal_clock);
+
+	static_key_slow_inc(&paravirt_steal_enabled);
+	if (steal_acc)
+		static_key_slow_inc(&paravirt_steal_rq_enabled);
+
+	pr_info("using stolen time PV\n");
+
+	return 0;
+}
+
+#ifdef CONFIG_PARAVIRT_SCHED
+DEFINE_PER_CPU(struct pvsched_vcpu_state, pvsched_vcpu_region) __aligned(64);
+EXPORT_PER_CPU_SYMBOL(pvsched_vcpu_region);
+
+static bool kvm_vcpu_is_preempted(int cpu)
+{
+	struct pvsched_vcpu_state *reg;
+	u32 preempted;
+
+	reg = &per_cpu(pvsched_vcpu_region, cpu);
+	if (!reg) {
+		pr_warn_once("PV sched enabled but not configured for cpu %d\n",
+			     cpu);
+		return false;
+	}
+
+	preempted = le32_to_cpu(READ_ONCE(reg->preempted));
+
+	return !!preempted;
+}
+
+static int pvsched_vcpu_state_dying_cpu(unsigned int cpu)
+{
+	struct pvsched_vcpu_state *reg;
+	struct arm_smccc_res res;
+
+	reg = this_cpu_ptr(&pvsched_vcpu_region);
+	if (!reg)
+		return -EFAULT;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_SCHED_IPA_RELEASE, &res);
+	memset(reg, 0, sizeof(*reg));
+
+	return 0;
+}
+
+static int init_pvsched_vcpu_state(unsigned int cpu)
+{
+	struct pvsched_vcpu_state *reg;
+	struct arm_smccc_res res;
+
+	reg = this_cpu_ptr(&pvsched_vcpu_region);
+	if (!reg)
+		return -EFAULT;
+
+	/* Pass the memory address to host via hypercall */
+	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_SCHED_IPA_INIT,
+			     virt_to_phys(reg), &res);
+
+	return 0;
+}
+
+static int kvm_arm_init_pvsched(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state(CPUHP_AP_ARM_KVM_PVSCHED_STARTING,
+				"hypervisor/arm/pvsched:starting",
+				init_pvsched_vcpu_state,
+				pvsched_vcpu_state_dying_cpu);
+
+	if (ret < 0) {
+		pr_warn("PV sched init failed\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+static bool has_kvm_pvsched(void)
+{
+	struct arm_smccc_res res;
+
+	/* To detect the presence of PV sched support we require SMCCC 1.1+ */
+	if (arm_smccc_1_1_get_conduit() == SMCCC_CONDUIT_NONE)
+		return false;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_ARCH_FEATURES_FUNC_ID,
+			     ARM_SMCCC_HV_PV_SCHED_FEATURES, &res);
+
+	return (res.a0 == SMCCC_RET_SUCCESS);
+}
+
+int __init pv_sched_init(void)
+{
+	int ret;
+
+	if (is_hyp_mode_available())
+		return 0;
+
+	if (!has_kvm_pvsched()) {
+		pr_warn("PV sched is not available\n");
+		return 0;
+	}
+
+	ret = kvm_arm_init_pvsched();
+	if (ret)
+		return ret;
+
+	static_call_update(pv_vcpu_preempted, kvm_vcpu_is_preempted);
+	pr_info("using PV sched preempted\n");
+
+	return 0;
+}
+early_initcall(pv_sched_init);
+#endif /* CONFIG_PARAVIRT_SCHED */
+
+#ifdef CONFIG_VIRT_VTIMER_PV_STATUS
+static void native_set_pvtimer_status(bool active) { }
+
+DEFINE_STATIC_CALL(pvtimer_status_set, native_set_pvtimer_status);
+
+struct pvtimer_status_region {
+	struct pvtimer_status_vcpu_state __rcu *kaddr;
+};
+
+static DEFINE_PER_CPU(struct pvtimer_status_region, vtimer_active_status_region);
+
+/* info hypervisor about timer active status */
+static void pv_set_pvtimer_status(bool active)
+{
+	struct pvtimer_status_vcpu_state *kaddr = NULL;
+	struct pvtimer_status_region *reg;
+
+	reg = this_cpu_ptr(&vtimer_active_status_region);
+
+	/*
+	 * paravirt_steal_clock() may be called before the CPU
+	 * online notification callback runs. Until the callback
+	 * has run we just return zero.
+	 */
+	rcu_read_lock();
+	kaddr = rcu_dereference(reg->kaddr);
+	if (!kaddr) {
+		rcu_read_unlock();
+		return;
+	}
+
+	WRITE_ONCE(kaddr->active, (int)active);
+	rcu_read_unlock();
+}
+
+static int pvtimer_status_cpu_down_prepare(unsigned int cpu)
+{
+	struct pvtimer_status_vcpu_state *kaddr = NULL;
+	struct pvtimer_status_region *reg;
+
+	reg = this_cpu_ptr(&vtimer_active_status_region);
+	if (!reg->kaddr)
+		return 0;
+
+	kaddr = rcu_replace_pointer(reg->kaddr, NULL, true);
+	synchronize_rcu();
+	memunmap(kaddr);
+
+	return 0;
+}
+
+static int pvtimer_status_cpu_online(unsigned int cpu)
+{
+	struct pvtimer_status_vcpu_state *kaddr = NULL;
+	struct pvtimer_status_region *reg;
+	struct arm_smccc_res res;
+
+	reg = this_cpu_ptr(&vtimer_active_status_region);
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_PVTIMER_STATUS_ENABLE, &res);
+
+	if (res.a0 == SMCCC_RET_NOT_SUPPORTED)
+		return -EINVAL;
+
+	kaddr = memremap(res.a0,
+			      sizeof(struct pvtimer_status_vcpu_state),
+			      MEMREMAP_WB);
+
+	rcu_assign_pointer(reg->kaddr, kaddr);
+
+	if (!reg->kaddr) {
+		pr_warn("Failed to map pvtimer status data structure\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int __init pvtimer_init_active_status_region(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+				"hypervisor/arm/pvtimer-status:online",
+				pvtimer_status_cpu_online,
+				pvtimer_status_cpu_down_prepare);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
+static bool __init has_pvtimer_status(void)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_PVTIMER_STATUS_FEATURES, &res);
+
+	if (res.a0 != SMCCC_RET_SUCCESS)
+		return false;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_PVTIMER_STATUS_ENABLE, &res);
+
+	return (res.a0 != SMCCC_RET_NOT_SUPPORTED);
+}
+
+int __init pvtimer_status_init(void)
+{
+	int ret;
+
+	if (!has_pvtimer_status())
+		return 0;
+
+	ret = pvtimer_init_active_status_region();
+	if (ret)
+		return ret;
+
+	static_call_update(pvtimer_status_set, pv_set_pvtimer_status);
+
+	pr_info("using pvtimer status\n");
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_VIRT_TIMER_EARLY_INJECT
+
+#include <asm/pvtimer-early-abi.h>
+
+static u64 native_get_timer_early_inject_ns(void)
+{
+	return 0;
+}
+
+DEFINE_STATIC_CALL(pv_timer_early_inject, native_get_timer_early_inject_ns);
+
+static struct pvtimer_early_vcpu_state *timer_early_kaddr;
+
+static u64 pv_get_timer_early_inject_ns(void)
+{
+	if (!timer_early_kaddr)
+		return 0;
+
+	return le64_to_cpu(READ_ONCE(timer_early_kaddr->early_ns));
+}
+
+static bool __init has_timer_early_inject(void)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_TIMER_EARLY_INJECT_FEATURES, &res);
+
+	return res.a0 == SMCCC_RET_SUCCESS;
+}
+
+int __init timer_early_inject_init(void)
+{
+	struct arm_smccc_res res;
+	phys_addr_t gpa;
+
+	if (!has_timer_early_inject())
+		return 0;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_TIMER_EARLY_INJECT_ENABLE, &res);
+	if (res.a0 == SMCCC_RET_NOT_SUPPORTED)
+		return 0;
+
+	gpa = res.a0;
+
+	timer_early_kaddr = memremap(gpa,
+				      sizeof(struct pvtimer_early_vcpu_state),
+				      MEMREMAP_WB);
+	if (!timer_early_kaddr) {
+		pr_warn("Failed to map timer early inject data structure\n");
+		return -ENOMEM;
+	}
+
+	static_call_update(pv_timer_early_inject, pv_get_timer_early_inject_ns);
+
+	pr_info("using timer early inject PV\n");
+	return 0;
+}
+
+#endif /* CONFIG_VIRT_TIMER_EARLY_INJECT */
+
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+extern bool nopvspin;
+
+static void kvm_kick_cpu(int cpu)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_KICK_CPU, cpu, &res);
+
+	trace_kvm_kick_cpu("kvm kick cpu", raw_smp_processor_id(), cpu);
+}
+
+static void kvm_wait(u8 *ptr, u8 val)
+{
+	unsigned long flags;
+
+	if (in_nmi())
+		return;
+
+	local_irq_save(flags);
+
+	if (READ_ONCE(*ptr) != val)
+		goto out;
+
+	trace_kvm_wait("kvm wait before wfi", smp_processor_id());
+
+	dsb(sy);
+	wfi();
+
+	trace_kvm_wait("kvm wait after wfi", smp_processor_id());
+
+out:
+	local_irq_restore(flags);
+}
+
+int __init pv_qspinlock_init(void)
+{
+	struct arm_smccc_res res;
+
+	if (nopvspin) {
+		pr_info("PV qspinlocks disabled, forced by \"nopvspin\" parameter\n");
+		return 0;
+	}
+
+	/* Check if KICK_CPU is supported by hypervisor */
+	arm_smccc_1_1_invoke(ARM_SMCCC_ARCH_FEATURES_FUNC_ID,
+			     ARM_SMCCC_VENDOR_KICK_CPU, &res);
+	if (res.a0 != SMCCC_RET_SUCCESS) {
+		pr_info("PV qspinlocks disabled, no KICK_CPU support\n");
+		return 0;
+	}
+
+	/* Don't use the PV qspinlock code if there is only 1 vCPU. */
+	if (num_possible_cpus() == 1) {
+		pr_info("PV qspinlocks disabled, single CPU\n");
+		return 0;
+	}
+	pr_info("PV qspinlocks enabled\n");
+
+	__pv_init_lock_hash();
+
+	pv_ops.lock.queued_spin_lock_slowpath = __pv_queued_spin_lock_slowpath;
+	pv_ops.lock.queued_spin_unlock = __pv_queued_spin_unlock;
+	pv_ops.lock.wait = kvm_wait;
+	pv_ops.lock.kick = kvm_kick_cpu;
+
+	return 0;
+}
+early_initcall(pv_qspinlock_init);
+#endif  /* CONFIG_PARAVIRT_SPINLOCKS */

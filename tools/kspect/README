@@ -1,0 +1,65 @@
+IFSTOOL - Interference Statistics Analytical Utility
+
+Overview
+========
+IFSTOOL is a specialized userspace utility designed to facilitate the
+monitoring and analysis of Interference Statistics (CONFIG_CGROUP_IFS).
+
+The IFS infrastructure is a kernel-level framework that provides critical
+observability into execution jitter (noise) that disrupts task determinism.
+It monitors and quantifies the CPU time stolen by kernel-level activities,
+such as: interrupt handling, softirqs, and lock contention. The framework
+exposes this telemetry via the interference.stat control file within the
+cgroup hierarchy.
+
+IFSTOOL interfaces with the interference.stat file to export raw metrics
+into structured CSV data and interactive HTML-based distribution reports.
+
+Setup
+=====
+The host environment must meet the following criteria:
+
+* Kernel: Compiled with `CONFIG_CGROUP_IFS=y`.
+* Boot Parameters: `cgroup_ifs=1` added to the kernel command line (optional,
+  not needed if `CONFIG_CGROUP_IFS_DEFAULT_ENABLED=y`).
+* Python Runtime: Python 3.x with `pandas` and `plotly` libraries.
+* Cgroup Hierarchy: Either v2 unified or v1 with the cpu subsystem mounted.
+
+Build
+=====
+IFSTOOL provides a Makefile to streamline the installation of the
+executable and its documentation.
+
+    $ make install
+
+Run
+===
+IFSTOOL operates via two primary functional modes: monitor and report.
+
+1. **Monitor:** Capture raw interference data from a target cgroup.
+
+    $ ifstool monitor --cgroup docker/<cid> --interval 1 --output capture.csv
+
+2. **Report:** Transform captured CSV data into an interactive HTML dashboard.
+
+   - Provide only --base for a single-session deep dive:
+
+        $ ifstool report --base capture.csv
+
+   - Provide both --base and --curr to render a differential report,
+     ideal for validating optimizations:
+
+        $ ifstool report --base baseline.csv --curr current.csv
+
+HTML Description
+================
+The generated HTML report provides a multi-dimensional view of kernel noise:
+
+- Total Time Delta Trend: A time-series line chart illustrating the incremental
+  nanoseconds of interference per category (e.g., irq, spinlock).
+- Latency Heatmaps: A frequency-domain visualization of the kernel's internal
+  histogram.
+  - X-axis: Wall-clock time of the trace.
+  - Y-axis: Latency magnitude (logarithmic buckets from ns to s).
+  - Color Intensity: Represents the density (event count) of interference
+    within that specific latency window.

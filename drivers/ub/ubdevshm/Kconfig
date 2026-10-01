@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0+
+# UB Device share memory support
+config UB_UBDEVSHM
+	tristate "ubdevshm driver"
+	help
+	   This option enables support for ubdevshm drivers. ubdev_shm serves
+	   as a basic mechanism, providing the ability for different memory providers
+	   to register and access or deregister and exit, managing shared memory
+	   contexts, and providing shared memory information for memory users.

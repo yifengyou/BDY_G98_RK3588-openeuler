@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config MFS_FS
+	tristate "MFS filesystem support"
+	help
+	  MFS provides a cache-programmable ability for users.
+	  It is a stackable file system, and will post miss events
+	  during reading data which is not in cache (memory or disk).
+	  Based on these events, users can trigger the target io for each
+	  application.
+
+	  If unsure, say N.

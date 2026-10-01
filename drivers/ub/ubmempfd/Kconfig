@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0+
+# UB Memory virtualization support
+config UB_UBMEMPFD
+	tristate "ubmempfd driver"
+	depends on UB_UBFI && UB_UMMU_CORE && UB_UMMU
+	help
+	   This option enables support for ubmempfd drivers. The ubmempfd
+	   driver provides address mapping on the host side for QEMU,
+	   which is a virtualization software that supports UB. And
+	   the vUMMU Driver implements the virtualization function of
+	   UMMU devices.

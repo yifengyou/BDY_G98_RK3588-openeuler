@@ -1,0 +1,101 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ *
+ * Description: ubagg topo info head file
+ * Author: Ma Chuan
+ * Create: 2025-06-07
+ * Note:
+ * History: 2025-06-07 Create file
+ */
+#ifndef ubagg_topo_info_H
+#define ubagg_topo_info_H
+
+#include <linux/types.h>
+#include <ub/urma/ubcore_types.h>
+
+#define EID_LEN (16)
+#define MAX_NODE_NUM (1024)
+#define MAX_PORT_NUM (9)
+#define IODIE_NUM_PER_CHIP (1)
+#define PORT_NUM (9)
+#define CHIP_NUM (2)
+#define DEV_NUM (256)
+#define IODIE_NUM (IODIE_NUM_PER_CHIP * CHIP_NUM)
+#define UBAGG_DEV_MAX_NUM (20)
+
+struct ubagg_topo_ue {
+	uint32_t chip_id;
+	uint32_t die_id;
+	uint32_t entity_id;
+	char primary_eid[EID_LEN];
+	char port_eid[PORT_NUM][EID_LEN];
+	char cna[PORT_NUM][EID_LEN];
+};
+
+struct ubagg_topo_agg_dev {
+	char agg_eid[EID_LEN];
+	struct ubagg_topo_ue ues[IODIE_NUM];
+};
+
+struct ubagg_topo_node {
+	uint32_t type;
+	uint32_t super_node_id;
+	uint32_t node_id;
+	uint32_t is_current;
+	bool links[IODIE_NUM * PORT_NUM][IODIE_NUM * PORT_NUM];
+	struct ubagg_topo_agg_dev agg_devs[DEV_NUM];
+};
+
+struct ubagg_topo_map {
+	struct ubagg_topo_node topo_infos[MAX_NODE_NUM];
+	uint32_t node_num;
+};
+
+struct ubagg_topo_by_eid_out {
+	uint32_t type;
+	uint32_t super_node_id;
+	uint32_t node_id;
+	uint32_t is_current;
+	uint32_t dev_idx;
+	/* Row is a current-node port and column is a matched-node port. */
+	bool links[IODIE_NUM * PORT_NUM][IODIE_NUM * PORT_NUM];
+	struct ubagg_topo_agg_dev agg_dev;
+};
+
+enum ubagg_topo_type {
+	UBAGG_TOPO_TYPE_FULLMESH,
+	UBAGG_TOPO_TYPE_CLOS
+};
+
+struct ubagg_topo_map *
+create_global_ubagg_topo_map(struct ubagg_topo_node *topo_infos,
+			     uint32_t node_num);
+
+void delete_global_ubagg_topo_map(void);
+
+struct ubagg_topo_map *get_global_ubagg_map(void);
+struct ubagg_topo_node *get_current_topo_node(void);
+int find_linked_port(
+	union ubcore_eid *dst_eid,
+	bool connected[UBAGG_DEV_MAX_NUM][UBAGG_DEV_MAX_NUM]);
+
+struct ubagg_topo_map *
+create_ubagg_topo_map_from_user(struct ubagg_topo_node *topo_infos,
+				uint32_t node_num);
+
+void delete_ubagg_topo_map(struct ubagg_topo_map *topo_map);
+
+struct ubagg_topo_node *find_cur_topo_node(struct ubagg_topo_map *topo_map);
+struct ubagg_topo_agg_dev *
+find_cur_topo_agg_dev(struct ubagg_topo_map *topo_map,
+		      const union ubcore_eid *bonding_eid);
+int ubagg_get_primary_eid_by_agg_eid(union ubcore_eid *agg_eid,
+	union ubcore_eid *primary_eid, uint32_t ue_id);
+bool ubagg_eid_belongs_to_agg(const union ubcore_eid *eid,
+	const union ubcore_eid *agg_eid);
+bool ubagg_eid_is_known(const union ubcore_eid *eid);
+int ubagg_get_topo_by_eid(const union ubcore_eid *eid,
+	struct ubagg_topo_by_eid_out *out);
+int ubagg_rebuild_topo_eid_index(struct ubagg_topo_map *topo_map);
+#endif // ubagg_topo_node_H

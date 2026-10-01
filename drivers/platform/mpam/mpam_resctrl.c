@@ -1,0 +1,2076 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright (C) 2021 Arm Ltd.
+
+#define pr_fmt(fmt) "mpam: resctrl: " fmt
+
+#include <linux/arm_mpam.h>
+#include <linux/cacheinfo.h>
+#include <linux/cpu.h>
+#include <linux/cpumask.h>
+#include <linux/errno.h>
+#include <linux/iommu.h>
+#include <linux/limits.h>
+#include <linux/list.h>
+#include <linux/printk.h>
+#include <linux/rculist.h>
+#include <linux/resctrl.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/wait.h>
+
+#include <asm/mpam.h>
+
+#include "mpam_internal.h"
+
+u64 mpam_resctrl_default_group;
+
+DECLARE_WAIT_QUEUE_HEAD(resctrl_mon_ctx_waiters);
+
+/*
+ * The classes we've picked to map to resctrl resources.
+ * Class pointer may be NULL.
+ */
+static struct mpam_resctrl_res mpam_resctrl_exports[RDT_NUM_RESOURCES];
+
+static bool exposed_alloc_capable;
+static bool exposed_mon_capable;
+static struct mpam_class *mbm_local_class;
+static struct mpam_class *mbm_total_class;
+static struct mpam_class *mbm_core_class;
+
+/*
+ * MPAM emulates CDP by setting different PARTID in the I/D fields of MPAM1_EL1.
+ * This applies globally to all traffic the CPU generates.
+ */
+static bool cdp_enabled;
+
+/*
+ * If resctrl_init() succeeded, resctrl_exit() can be used to remove support
+ * for the filesystem in the event of an error.
+ */
+static bool resctrl_enabled;
+
+/*
+ * mpam_resctrl_pick_caches() needs to know the size of the caches. cacheinfo
+ * populates this from a device_initcall(). mpam_resctrl_setup() must wait.
+ */
+static bool cacheinfo_ready;
+static DECLARE_WAIT_QUEUE_HEAD(wait_cacheinfo_ready);
+
+/* A dummy mon context to use when the monitors were allocated up front */
+u32 __mon_is_rmid_idx = USE_RMID_IDX;
+
+bool resctrl_arch_alloc_capable(void)
+{
+	return exposed_alloc_capable;
+}
+
+bool resctrl_arch_mon_capable(void)
+{
+	return exposed_mon_capable;
+}
+
+bool resctrl_arch_is_mbm_local_enabled(void)
+{
+	return mbm_local_class;
+}
+
+bool resctrl_arch_is_mbm_total_enabled(void)
+{
+	return mbm_total_class;
+}
+
+bool resctrl_arch_is_mbm_core_enabled(void)
+{
+	return mbm_core_class;
+}
+
+bool resctrl_arch_is_mbm_enabled(enum resctrl_res_level rid)
+{
+	switch (rid) {
+	case RDT_RESOURCE_L2:
+		return resctrl_arch_is_mbm_core_enabled();
+	case RDT_RESOURCE_L3:
+		return resctrl_arch_is_mbm_local_enabled();
+	case RDT_RESOURCE_MBA:
+		return resctrl_arch_is_mbm_total_enabled();
+	default:
+		return false;
+	}
+}
+
+void resctrl_arch_setup_res_mbm_over(void)
+{
+	struct mpam_resctrl_res *res;
+	int i;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+
+		if (!res->class)
+			continue;
+
+		resctrl_setup_dom_overflow(&res->resctrl_res);
+	}
+}
+
+void resctrl_arch_setup_res_mbm_over_exclude_cpu(unsigned int exclude_cpu)
+{
+	struct mpam_resctrl_res *res;
+	struct rdt_domain *d;
+	int i;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+
+		if (!res->class)
+			continue;
+
+		d = resctrl_get_domain_from_cpu(exclude_cpu, &res->resctrl_res);
+		if (d)
+			resctrl_setup_dom_overflow_exclude_cpu(&res->resctrl_res,
+								d, exclude_cpu);
+	}
+}
+
+void resctrl_arch_mbm_update(struct rdt_domain *d,
+			     u32 closid, u32 rmid)
+{
+	switch (d->res->rid) {
+	case RDT_RESOURCE_MBA:
+		if (resctrl_arch_is_mbm_total_enabled())
+			resctrl_mbm_update_one(d->res, d,
+					       QOS_L3_MBM_TOTAL_EVENT_ID,
+					       closid, rmid);
+		break;
+
+	case RDT_RESOURCE_L3:
+		if (resctrl_arch_is_mbm_local_enabled())
+			resctrl_mbm_update_one(d->res, d,
+					       QOS_L3_MBM_LOCAL_EVENT_ID,
+					       closid, rmid);
+		break;
+
+	case RDT_RESOURCE_L2:
+		if (resctrl_arch_is_mbm_core_enabled() && !d->res->invisible)
+			resctrl_mbm_update_one(d->res, d,
+					       QOS_L2_MBM_CORE_OVERFLOW_EVENT_ID,
+					       closid, rmid);
+		break;
+
+	default:
+		break;
+	}
+}
+
+bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)
+{
+	switch (rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		return cdp_enabled;
+	case RDT_RESOURCE_MBA:
+	default:
+		/*
+		 * x86's MBA control doesn't support CDP, so user-space doesn't
+		 * expect it.
+		 */
+		return false;
+	}
+}
+
+int resctrl_arch_set_cdp_enabled(enum resctrl_res_level ignored, bool enable)
+{
+	u64 regval;
+	struct rdt_resource *r;
+	u32 i, partid, partid_i, partid_d;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		r = resctrl_arch_get_resource(i);
+		if (r->mon_capable) {
+			r->num_rmid = resctrl_arch_system_num_rmid_idx();
+			if (enable)
+				r->num_rmid >>= 1;
+		}
+	}
+
+	cdp_enabled = enable;
+
+	partid = RESCTRL_RESERVED_CLOSID;
+
+	if (enable) {
+		partid_d = resctrl_get_config_index(partid, CDP_DATA);
+		partid_i = resctrl_get_config_index(partid, CDP_CODE);
+		regval = FIELD_PREP(MPAM_SYSREG_PARTID_D, partid_d) |
+			 FIELD_PREP(MPAM_SYSREG_PARTID_I, partid_i);
+
+	} else {
+		regval = FIELD_PREP(MPAM_SYSREG_PARTID_D, partid) |
+			 FIELD_PREP(MPAM_SYSREG_PARTID_I, partid);
+	}
+
+	WRITE_ONCE(mpam_resctrl_default_group, regval);
+
+	return 0;
+}
+
+static bool mpam_resctrl_hide_cdp(enum resctrl_res_level rid)
+{
+	return cdp_enabled && !resctrl_arch_get_cdp_enabled(rid);
+}
+
+/*
+ * MSC may raise an error interrupt if it sees an out or range partid/pmg,
+ * and go on to truncate the value. Regardless of what the hardware supports,
+ * only the system wide safe value is safe to use.
+ */
+u32 resctrl_arch_get_num_closid(struct rdt_resource *ignored)
+{
+	return mpam_intpartid_max + 1;
+}
+
+/*
+ * Determine the effective number of PARTIDs available for resctrl.
+ *
+ * This function performs a one-time check to determine if Narrow-PARTID
+ * can be used. It must be called after mpam_resctrl_pick_{mba,caches}()
+ * have initialized the resource classes, as class properties are used
+ * to detect Narrow-PARTID support.
+ *
+ * The first call occurs in update_rmid_limits(), ensuring the
+ * prerequisite initialization is complete.
+ */
+u32 get_num_reqpartid(void)
+{
+	struct mpam_props *cprops;
+	struct mpam_class *class;
+	static bool first = true;
+	int idx;
+
+	if (first) {
+		idx = srcu_read_lock(&mpam_srcu);
+		list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+			cprops = &class->props;
+			if (mpam_has_feature(mpam_feat_partid_nrw, cprops))
+				continue;
+
+			if (mpam_has_feature(mpam_feat_mbw_max, cprops) ||
+			    mpam_has_feature(mpam_feat_mbw_min, cprops) ||
+			    mpam_has_feature(mpam_feat_ccap_part, cprops) ||
+			    mpam_has_feature(mpam_feat_cmin, cprops)) {
+				mpam_partid_max = mpam_intpartid_max;
+				break;
+			}
+		}
+		srcu_read_unlock(&mpam_srcu, idx);
+	}
+
+	first = false;
+	return mpam_partid_max + 1;
+}
+
+u32 resctrl_arch_system_num_rmid_idx(void)
+{
+	return (mpam_pmg_max + 1) * get_num_reqpartid();
+}
+
+static u32 rmid2reqpartid(u32 rmid)
+{
+	u8 pmg_shift = fls(mpam_pmg_max);
+	u32 reqpartid;
+
+	WARN_ON_ONCE(pmg_shift > 8);
+
+	rmid >>= pmg_shift;
+
+	if (cdp_enabled)
+		reqpartid = resctrl_get_config_index(rmid, CDP_DATA);
+	else
+		reqpartid = resctrl_get_config_index(rmid, CDP_NONE);
+
+	return reqpartid;
+}
+
+static u8 rmid2pmg(u32 rmid)
+{
+	u8 pmg_shift = fls(mpam_pmg_max);
+	u32 pmg_mask = ~(~0 << pmg_shift);
+
+	return rmid & pmg_mask;
+}
+
+static u32 req_pmg2rmid(u32 reqpartid, u8 pmg)
+{
+	u8 pmg_shift = fls(mpam_pmg_max);
+	u32 pmg_mask = ~(~0 << pmg_shift);
+
+	if (cdp_enabled)
+		reqpartid >>= 1;
+
+	return (reqpartid << pmg_shift) | (pmg & pmg_mask);
+}
+
+static u32 *reqpartid_map;
+
+u32 req2intpartid(u32 reqpartid)
+{
+	/*
+	 * Directly return intPartid in case that mpam_reset_ris() access
+	 * NULL pointer.
+	 */
+	if (reqpartid < resctrl_arch_get_num_closid(NULL))
+		return reqpartid;
+
+	return reqpartid_map[reqpartid];
+}
+
+static u32 partid2closid(u32 partid)
+{
+	if (cdp_enabled)
+		partid >>= 1;
+
+	return partid;
+}
+
+/*
+ * To avoid the reuse of rmid across multiple control groups, check
+ * the incoming closid to prevent rmid from being reallocated by
+ * resctrl_find_free_rmid().
+ *
+ * If the closid and rmid do not match upon inspection, immediately
+ * returns an invalid rmid. A valid rmid must not exceed 24 bits.
+ */
+u32 resctrl_arch_rmid_idx_encode(u32 closid, u32 rmid)
+{
+	u32 reqpartid = rmid2reqpartid(rmid);
+
+	/* When enable CDP mode, needs to filter invalid rmid entry out */
+	if (reqpartid >= get_num_reqpartid())
+		return U32_MAX;
+
+	if (closid != partid2closid(req2intpartid(reqpartid)))
+		return U32_MAX;
+
+	return rmid;
+}
+
+void resctrl_arch_rmid_idx_decode(u32 idx, u32 *closid, u32 *rmid)
+{
+	u32 reqpartid = rmid2reqpartid(idx);
+	u32 intpartid = req2intpartid(reqpartid);
+
+	if (rmid)
+		*rmid = idx;
+
+	if (closid)
+		*closid = partid2closid(intpartid);
+}
+
+void resctrl_sched_in(struct task_struct *tsk)
+{
+	lockdep_assert_preemption_disabled();
+
+	mpam_thread_switch(tsk);
+}
+
+void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid)
+{
+	u32 reqpartid = rmid2reqpartid(rmid);
+	u8 pmg = rmid2pmg(rmid);
+
+	WARN_ON_ONCE(reqpartid > U16_MAX);
+	WARN_ON_ONCE(pmg > U8_MAX);
+
+	if (!cdp_enabled)
+		mpam_set_cpu_defaults(cpu, reqpartid, reqpartid, pmg, pmg);
+	else
+		/*
+		 * When CDP is enabled, resctrl halves the closid range and we
+		 * use odd/even partid for one closid.
+		 */
+		mpam_set_cpu_defaults(cpu, reqpartid, reqpartid + 1, pmg, pmg);
+}
+
+void resctrl_arch_sync_cpu_defaults(void *info)
+{
+	struct resctrl_cpu_sync *r = info;
+
+	lockdep_assert_preemption_disabled();
+
+	if (r) {
+		resctrl_arch_set_cpu_default_closid_rmid(smp_processor_id(),
+							 r->closid, r->rmid);
+	}
+
+	resctrl_sched_in(current);
+}
+
+void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
+{
+	u32 reqpartid = rmid2reqpartid(rmid);
+	u8 pmg = rmid2pmg(rmid);
+
+	WARN_ON_ONCE(reqpartid > U16_MAX);
+	WARN_ON_ONCE(pmg > U8_MAX);
+
+	if (!cdp_enabled)
+		mpam_set_task_partid_pmg(tsk, reqpartid, reqpartid, pmg, pmg);
+	else
+		mpam_set_task_partid_pmg(tsk, reqpartid, reqpartid + 1, pmg, pmg);
+}
+
+bool resctrl_arch_match_closid(struct task_struct *tsk, u32 closid)
+{
+	u64 regval = mpam_get_regval(tsk);
+	u32 tsk_partid = FIELD_GET(MPAM1_EL1_PARTID_D, regval);
+
+	tsk_partid = req2intpartid(tsk_partid);
+
+	if (cdp_enabled)
+		tsk_partid >>= 1;
+
+	return tsk_partid == closid;
+}
+
+/* The task's pmg is not unique, the partid must be considered too */
+bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
+{
+	u64 regval = mpam_get_regval(tsk);
+	u32 tsk_partid = FIELD_GET(MPAM1_EL1_PARTID_D, regval);
+	u32 tsk_pmg = FIELD_GET(MPAM1_EL1_PMG_D, regval);
+
+	return (tsk_partid == rmid2reqpartid(rmid)) &&
+	       (tsk_pmg == rmid2pmg(rmid));
+}
+
+#ifdef CONFIG_RESCTRL_IOMMU
+int resctrl_arch_set_iommu_closid_rmid(struct iommu_group *group, u32 closid,
+				       u32 rmid)
+{
+	return iommu_group_set_qos_params(group, rmid2reqpartid(rmid),
+					  rmid2pmg(rmid));
+}
+
+bool resctrl_arch_match_iommu_closid(struct iommu_group *group, u32 closid)
+{
+	u16 reqpartid;
+	int err = iommu_group_get_qos_params(group, &reqpartid, NULL);
+
+	if (err)
+		return false;
+
+	if (cdp_enabled)
+		closid <<= 1;
+
+	return req2intpartid(reqpartid) == closid;
+}
+
+bool resctrl_arch_match_iommu_closid_rmid(struct iommu_group *group,
+					  u32 closid, u32 rmid)
+{
+	u8 pmg;
+	u16 reqpartid;
+	int err = iommu_group_get_qos_params(group, &reqpartid, &pmg);
+
+	if (err)
+		return false;
+
+	return req_pmg2rmid(reqpartid, pmg) == rmid;
+}
+#endif
+
+struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
+{
+	if (l >= RDT_NUM_RESOURCES)
+		return NULL;
+
+	return &mpam_resctrl_exports[l].resctrl_res;
+}
+
+void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r, int evtid)
+{
+	u32 *ret;
+
+	ret = kmalloc(sizeof(*ret), GFP_KERNEL);
+	if (!ret)
+		return ERR_PTR(-ENOMEM);
+
+	*ret = __mon_is_rmid_idx;
+	return ret;
+}
+
+void resctrl_arch_mon_ctx_free(struct rdt_resource *r, int evtid,
+			       void *arch_mon_ctx)
+{
+	kfree(arch_mon_ctx);
+}
+
+static enum mon_filter_options resctrl_evt_config_to_mpam(u32 local_evt_cfg)
+{
+	switch (local_evt_cfg) {
+	case READS_TO_LOCAL_MEM:
+		return COUNT_READ;
+	case NON_TEMP_WRITE_TO_LOCAL_MEM:
+		return COUNT_WRITE;
+	default:
+		return COUNT_BOTH;
+	}
+}
+
+/*
+ * Check whether to skip L2 MBM overflow checking for a given component.
+ *
+ * The number of L2 monitors is less than the number of RMIDs, so we only
+ * check MBM overflow for RMIDs currently being monitored by the monitor.
+ * When handling QOS_L2_MBM_CORE_OVERFLOW_EVENT_ID, we verify if the current
+ * monitoring configuration (partid/pmg) matches the previously saved one in
+ * mbwu_state. If they match, it means this RMID is still being monitored
+ * and we should proceed with overflow check. Otherwise, skip it.
+ *
+ * Returns:
+ *   false - Don't skip, proceed with overflow check (partid/pmg match)
+ *   true  - Skip overflow check (no matching configuration found)
+ */
+static bool mpam_skip_check_l2_overflow(struct mpam_component *comp,
+					struct mon_cfg *cfg)
+{
+	bool ret;
+	unsigned long flags;
+	struct mpam_msc_ris *ris;
+	struct msmon_mbwu_state	*mbwu_state;
+
+	ris = list_first_or_null_rcu(&comp->ris, struct mpam_msc_ris, comp_list);
+	if (!ris)
+		return true;
+
+	mbwu_state = &ris->mbwu_state[cfg->mon];
+
+	spin_lock_irqsave(&ris->msc->mon_sel_lock, flags);
+	ret = (mbwu_state->cfg.partid != cfg->partid ||
+	       mbwu_state->cfg.pmg != cfg->pmg);
+	spin_unlock_irqrestore(&ris->msc->mon_sel_lock, flags);
+
+	return ret;
+}
+
+int resctrl_arch_rmid_read(struct rdt_resource	*r, struct rdt_domain *d,
+			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
+			   u64 *val, void *arch_mon_ctx)
+{
+	int err;
+	u64 cdp_val;
+	u16 num_mon;
+	struct mon_cfg cfg;
+	struct mpam_resctrl_dom *dom;
+	struct mpam_resctrl_res *res;
+	enum mpam_device_features type;
+
+	resctrl_arch_rmid_read_context_check();
+
+	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+	case QOS_L2_OCCUP_EVENT_ID:
+		type = mpam_feat_msmon_csu;
+		break;
+	case QOS_L3_MBM_LOCAL_EVENT_ID:
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+	case QOS_L2_MBM_CORE_EVENT_ID:
+	case QOS_L2_MBM_CORE_OVERFLOW_EVENT_ID:
+		type = mpam_feat_msmon_mbwu;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/*
+	 * The number of mbwu monitors can't support free run mode,
+	 * adapt the remainder of rmid to the num_mon as compromise.
+	 */
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	if (type == mpam_feat_msmon_mbwu)
+		num_mon = res->class->props.num_mbwu_mon;
+	else
+		num_mon = res->class->props.num_csu_mon;
+
+	cfg.match_pmg = true;
+	cfg.pmg = rmid2pmg(rmid);
+	cfg.opts = resctrl_evt_config_to_mpam(dom->mbm_local_evt_cfg);
+	cfg.partid = rmid2reqpartid(rmid);
+
+	cfg.mon = cfg.partid % num_mon;
+
+	if (eventid == QOS_L2_MBM_CORE_OVERFLOW_EVENT_ID) {
+		if (mpam_skip_check_l2_overflow(dom->comp, &cfg))
+			return 0;
+	}
+
+	err = mpam_msmon_read(dom->comp, &cfg, type, val);
+	if (err)
+		return err;
+
+	if (cdp_enabled) {
+		cfg.partid += 1;
+		cfg.mon = cfg.partid % num_mon;
+		err = mpam_msmon_read(dom->comp, &cfg, type, &cdp_val);
+		if (!err) {
+			pr_debug("read monitor closid %u rmid %u %s:%u CODE/DATA: %lld/%lld\n",
+				  closid, rmid, r->name, dom->comp->comp_id, cdp_val, *val);
+			*val += cdp_val;
+		}
+	}
+
+	return err;
+}
+
+void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
+			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
+{
+	u16 num_mbwu_mon;
+	struct mon_cfg cfg;
+	struct mpam_resctrl_dom *dom;
+	struct mpam_resctrl_res *res;
+
+	if (eventid == QOS_L3_OCCUP_EVENT_ID ||
+	    eventid == QOS_L2_OCCUP_EVENT_ID)
+		return;
+
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	num_mbwu_mon = res->class->props.num_mbwu_mon;
+	cfg.mon = resctrl_arch_rmid_idx_encode(closid, rmid) % num_mbwu_mon;
+	cfg.match_pmg = true;
+	cfg.pmg = rmid2pmg(rmid);
+	cfg.partid = rmid2reqpartid(rmid);
+
+	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+	mpam_msmon_reset_mbwu(dom->comp, &cfg);
+
+	if (cdp_enabled) {
+		cfg.partid += 1;
+		mpam_msmon_reset_mbwu(dom->comp, &cfg);
+	}
+}
+
+/*
+ * The rmid realloc threshold should be for the smallest cache exposed to
+ * resctrl.
+ */
+static void update_rmid_limits(struct mpam_class *class)
+{
+	u32 num_unique_pmg = resctrl_arch_system_num_rmid_idx();
+	unsigned int size;
+
+	/* Assume cache levels are the same size for all CPUs... */
+	size = get_cpu_cacheinfo_size(smp_processor_id(), class->level);
+
+	if (WARN_ON_ONCE(!size))
+		return;
+
+	if (resctrl_rmid_realloc_limit && size > resctrl_rmid_realloc_limit)
+		return;
+
+	resctrl_rmid_realloc_limit = size;
+	resctrl_rmid_realloc_threshold = size / num_unique_pmg;
+}
+
+static bool cache_has_usable_cpor(struct mpam_class *class)
+{
+	struct mpam_props *cprops = &class->props;
+
+	if (!mpam_has_feature(mpam_feat_cpor_part, cprops))
+		return false;
+
+	/* TODO: Scaling is not yet supported */
+	return (class->props.cpbm_wd <= RESCTRL_MAX_CBM);
+}
+
+static bool cache_has_usable_cmax(struct mpam_class *class)
+{
+	struct mpam_props *cprops = &class->props;
+
+	return mpam_has_feature(mpam_feat_ccap_part, cprops);
+}
+
+static bool cache_has_usable_cmin(struct mpam_class *class)
+{
+	struct mpam_props *cprops = &class->props;
+
+	return mpam_has_feature(mpam_feat_cmin, cprops);
+}
+
+static bool cache_has_usable_csu(struct mpam_class *class)
+{
+	struct mpam_props *cprops;
+
+	if (!class)
+		return false;
+
+	cprops = &class->props;
+
+	if (!mpam_has_feature(mpam_feat_msmon_csu, cprops))
+		return false;
+
+	/*
+	 * CSU counters settle on the value, so we can get away with
+	 * having only one.
+	 */
+	if (!cprops->num_csu_mon)
+		return false;
+
+	return (mpam_partid_max > 1) || (mpam_pmg_max != 0);
+}
+
+bool resctrl_arch_is_llc_occupancy_enabled(void)
+{
+	return cache_has_usable_csu(mpam_resctrl_exports[RDT_RESOURCE_L3].class);
+}
+
+bool resctrl_arch_is_l2c_occupancy_enabled(void)
+{
+	return cache_has_usable_csu(mpam_resctrl_exports[RDT_RESOURCE_L2].class);
+}
+
+static bool class_has_usable_mbwu(struct mpam_class *class)
+{
+	struct mpam_props *cprops = &class->props;
+
+	if (!mpam_has_feature(mpam_feat_msmon_mbwu, cprops))
+		return false;
+
+	return (mpam_partid_max > 1) || (mpam_pmg_max != 0);
+}
+
+static bool mba_class_use_mbw_part(struct mpam_props *cprops)
+{
+	/* TODO: Scaling is not yet supported */
+	return (mpam_has_feature(mpam_feat_mbw_part, cprops) &&
+		cprops->mbw_pbm_bits < MAX_MBA_BW);
+}
+
+static bool class_has_usable_mba(struct mpam_props *cprops)
+{
+	if (mba_class_use_mbw_part(cprops) ||
+	    mpam_has_feature(mpam_feat_mbw_max, cprops))
+		return true;
+
+	return false;
+}
+
+static bool class_has_usable_mbw_min(struct mpam_props *cprops)
+{
+	if (mpam_has_feature(mpam_feat_mbw_min, cprops))
+		return true;
+
+	return false;
+}
+
+static bool class_has_usable_intpri(struct mpam_props *cprops)
+{
+	if (mpam_has_feature(mpam_feat_intpri_part, cprops))
+		return true;
+
+	return false;
+}
+
+static bool class_has_usable_max_limit(struct mpam_props *cprops)
+{
+	if (mpam_has_feature(mpam_feat_max_limit, cprops))
+		return true;
+
+	return false;
+}
+
+/*
+ * Calculate the percentage change from each implemented bit in the control
+ * This can return 0 when BWA_WD is greater than 6. (100 / (1<<7) == 0)
+ */
+static u32 get_mba_granularity(struct mpam_props *cprops)
+{
+	if (mba_class_use_mbw_part(cprops)) {
+		return MAX_MBA_BW / cprops->mbw_pbm_bits;
+	} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+		/*
+		 * bwa_wd is the number of bits implemented in the 0.xxx
+		 * fixed point fraction. 1 bit is 50%, 2 is 25% etc.
+		 */
+		return MAX_MBA_BW / (1 << cprops->bwa_wd);
+	}
+
+	return 0;
+}
+
+static u32 mbw_pbm_to_percent(unsigned long mbw_pbm, struct mpam_props *cprops)
+{
+	u32 bit, result = 0, granularity = get_mba_granularity(cprops);
+
+	for_each_set_bit(bit, &mbw_pbm, cprops->mbw_pbm_bits % 32) {
+		result += granularity;
+	}
+
+	return result;
+}
+
+static int get_wd_precision(u8 wd)
+{
+	int ret = (1 << wd) / MAX_MBA_BW;
+
+	if (!ret)
+		return 1;
+
+	return ret;
+}
+
+static u32 mbw_max_to_percent(u16 mbw_max, u8 wd)
+{
+	u8 bit;
+	u32 divisor = 2, value = 0, precision = get_wd_precision(wd);
+
+	if (mbw_max == GENMASK(15, 16 - wd))
+		return MAX_MBA_BW;
+
+	for (bit = 15; bit; bit--) {
+		if (mbw_max & BIT(bit))
+			value += MAX_MBA_BW * precision / divisor;
+		divisor <<= 1;
+	}
+
+	return DIV_ROUND_UP(value, precision);
+}
+
+static u32 percent_to_mbw_pbm(u32 pc, struct mpam_props *cprops)
+{
+	u32 granularity = get_mba_granularity(cprops);
+	u8 num_bits = pc / granularity;
+
+	if (!num_bits)
+		return 0;
+
+	/* TODO: pick bits at random to avoid contention */
+	return (1 << num_bits) - 1;
+}
+
+static u16 percent_to_mbw_max(u32 pc, u8 wd)
+{
+	u8 bit;
+	u32 divisor = 2, value = 0, precision = get_wd_precision(wd);
+
+	if (WARN_ON_ONCE(wd > 16))
+		/* All bits valid as fallback */
+		return GENMASK(15, 0);
+
+	if (pc == MAX_MBA_BW)
+		return GENMASK(15, 16 - wd);
+
+	pc *= precision;
+
+	for (bit = 15; bit; bit--) {
+		if (pc >= MAX_MBA_BW * precision / divisor) {
+			pc -= MAX_MBA_BW * precision / divisor;
+			value |= BIT(bit);
+		}
+		divisor <<= 1;
+
+		if (!pc || !(MAX_MBA_BW * precision / divisor))
+			break;
+	}
+
+	value &= GENMASK(15, 16 - wd);
+
+	return value;
+}
+
+static u16 percent_to_ca_max(u32 pc, u8 wd)
+{
+	struct rdt_resource *l3 = resctrl_arch_get_resource(RDT_RESOURCE_L3);
+	u32 valid_max, ca_max;
+
+	if (read_cpuid_implementor() != ARM_CPU_IMP_HISI)
+		return percent_to_mbw_max(pc, wd);
+
+	valid_max = mpam_cpbm_wd_hisi_workaround(l3->cache.cbm_len,
+						 mpam_feat_ccap_part,
+						 l3->cache_level);
+
+	if (pc >= MAX_MBA_BW)
+		return valid_max << (16 - wd);
+
+	ca_max = DIV_ROUND_UP(pc * valid_max, 100);
+	return ca_max << (16 - wd);
+}
+
+static u16 ca_max_to_percent(u16 ca_max, u8 wd)
+{
+	struct rdt_resource *l3 = resctrl_arch_get_resource(RDT_RESOURCE_L3);
+	u32 valid_max;
+
+	if (read_cpuid_implementor() != ARM_CPU_IMP_HISI)
+		return mbw_max_to_percent(ca_max, wd);
+
+	valid_max = mpam_cpbm_wd_hisi_workaround(l3->cache.cbm_len,
+						 mpam_feat_ccap_part,
+						 l3->cache_level);
+
+	ca_max = ca_max >> (16 - wd);
+	if (ca_max >= valid_max)
+		return MAX_MBA_BW;
+
+	return (ca_max * 100) / valid_max;
+}
+
+/* Test whether we can export MPAM_CLASS_CACHE:{2,3}? */
+static void mpam_resctrl_pick_caches(void)
+{
+	int idx;
+	struct mpam_class *class;
+	struct mpam_resctrl_res *res;
+	bool has_cpor, has_cmax, has_cmin, has_intpri;
+
+	lockdep_assert_cpus_held();
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		struct mpam_props *cprops = &class->props;
+
+		has_cpor = cache_has_usable_cpor(class);
+		has_cmax = cache_has_usable_cmax(class);
+		has_cmin = cache_has_usable_cmin(class);
+		has_intpri = class_has_usable_intpri(cprops);
+
+		if (class->type != MPAM_CLASS_CACHE) {
+			pr_debug("pick_caches: Class is not a cache\n");
+			continue;
+		}
+
+		if (class->level != 2 && class->level != 3) {
+			pr_debug("pick_caches: not L2 or L3\n");
+			continue;
+		}
+
+		if (class->level == 2 && !has_cpor) {
+			pr_debug("pick_caches: L2 missing CPOR\n");
+			continue;
+		}
+		else if (!has_cpor && !cache_has_usable_csu(class)) {
+			pr_debug("pick_caches: Cache misses CPOR and CSU\n");
+			continue;
+		}
+
+		if (!cpumask_equal(&class->affinity, cpu_possible_mask)) {
+			pr_debug("pick_caches: Class has missing CPUs\n");
+			continue;
+		}
+
+		if (has_cpor) {
+			if (class->level == 2) {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L2];
+				res->resctrl_res.name = "L2";
+			} else {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L3];
+				res->resctrl_res.name = "L3";
+			}
+			res->class = class;
+		}
+
+		if (has_cmax) {
+			if (class->level == 2) {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L2_MAX];
+				res->resctrl_res.name = "L2MAX";
+			} else {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L3_MAX];
+				res->resctrl_res.name = "L3MAX";
+			}
+			res->class = class;
+		}
+
+		if (has_cmin) {
+			if (class->level == 2) {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L2_MIN];
+				res->resctrl_res.name = "L2MIN";
+			} else {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L3_MIN];
+				res->resctrl_res.name = "L3MIN";
+			}
+			res->class = class;
+		}
+
+		if (has_intpri) {
+			if (class->level == 2) {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L2_PRI];
+				res->resctrl_res.name = "L2PRI";
+			} else {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_L3_PRI];
+				res->resctrl_res.name = "L3PRI";
+			}
+			res->class = class;
+		}
+	}
+	srcu_read_unlock(&mpam_srcu, idx);
+}
+
+static void mpam_resctrl_pick_mba(void)
+{
+	bool has_mba, has_mbw_min, has_intpri, has_limit;
+	struct mpam_resctrl_res *res;
+	struct mpam_class *class;
+	int idx;
+
+	lockdep_assert_cpus_held();
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		struct mpam_props *cprops = &class->props;
+
+		has_mba = class_has_usable_mba(cprops);
+		has_mbw_min = class_has_usable_mbw_min(cprops);
+		has_intpri = class_has_usable_intpri(cprops);
+		has_limit = class_has_usable_max_limit(cprops);
+
+		if (class->level < 3)
+			continue;
+
+		if (!cpumask_equal(&class->affinity, cpu_possible_mask))
+			continue;
+
+		if (has_mba) {
+			res = &mpam_resctrl_exports[RDT_RESOURCE_MBA];
+			res->class = class;
+			res->resctrl_res.name = "MB";
+
+			if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+				res = &mpam_resctrl_exports[RDT_RESOURCE_MB_OPT];
+				res->class = class;
+				res->resctrl_res.name = "MBOPT";
+			}
+		}
+
+		if (has_mbw_min) {
+			res = &mpam_resctrl_exports[RDT_RESOURCE_MB_MIN];
+			res->class = class;
+			res->resctrl_res.name = "MBMIN";
+		}
+
+		if (has_intpri) {
+			res = &mpam_resctrl_exports[RDT_RESOURCE_MB_PRI];
+			res->class = class;
+			res->resctrl_res.name = "MBPRI";
+		}
+
+		if (has_limit) {
+			res = &mpam_resctrl_exports[RDT_RESOURCE_MB_HDL];
+			res->class = class;
+			res->resctrl_res.name = "MBHDL";
+		}
+	}
+	srcu_read_unlock(&mpam_srcu, idx);
+}
+
+static void mpam_resctrl_pick_counters(void)
+{
+	struct mpam_class *class;
+	int idx;
+
+	idx = srcu_read_lock(&mpam_srcu);
+
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		if (mpam_has_feature(mpam_feat_msmon_csu, &class->props)) {
+			if (class->level == 3)
+				update_rmid_limits(class);
+		}
+	}
+
+	srcu_read_unlock(&mpam_srcu, idx);
+}
+
+bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
+{
+	struct mpam_props *cprops;
+
+	switch (evt) {
+        case QOS_L3_MBM_LOCAL_EVENT_ID:
+		if (!mbm_local_class)
+			return false;
+		cprops = &mbm_local_class->props;
+
+		return mpam_has_feature(mpam_feat_msmon_mbwu_rwbw, cprops);
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		if (!mbm_total_class)
+			return false;
+
+		cprops = &mbm_total_class->props;
+		return mpam_has_feature(mpam_feat_msmon_mbwu_rwbw, cprops);
+	default:
+		return false;
+	}
+}
+
+void resctrl_arch_mon_event_config_read(void *info)
+{
+	struct mpam_resctrl_dom *dom;
+	struct resctrl_mon_config_info *mon_info = info;
+
+	dom = container_of(mon_info->d, struct mpam_resctrl_dom, resctrl_dom);
+	mon_info->mon_config = dom->mbm_local_evt_cfg & MAX_EVT_CONFIG_BITS;
+}
+
+void resctrl_arch_mon_event_config_write(void *info)
+{
+	struct mpam_resctrl_dom *dom;
+	struct resctrl_mon_config_info *mon_info = info;
+
+	if (mon_info->mon_config & ~MPAM_RESTRL_EVT_CONFIG_VALID) {
+		mon_info->err = -EOPNOTSUPP;
+		return;
+	}
+
+	dom = container_of(mon_info->d, struct mpam_resctrl_dom, resctrl_dom);
+	dom->mbm_local_evt_cfg = mon_info->mon_config & MPAM_RESTRL_EVT_CONFIG_VALID;
+}
+
+void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_domain *d)
+{
+	struct mpam_resctrl_dom *dom;
+
+	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+	dom->mbm_local_evt_cfg = MPAM_RESTRL_EVT_CONFIG_VALID;
+	mpam_msmon_reset_all_mbwu(dom->comp);
+}
+
+static void mpam_llc_gran_hisi_workaround(struct rdt_resource *r)
+{
+	unsigned int cbm_len;
+
+	if (read_cpuid_implementor() != ARM_CPU_IMP_HISI)
+		return;
+
+	if (r->fflags != RFTYPE_RES_CACHE || r->cache_level != 3)
+		return;
+
+	cbm_len = resctrl_arch_get_resource(RDT_RESOURCE_L3)->cache.cbm_len;
+	r->membw.bw_gran = max(100 / cbm_len, 1);
+}
+
+static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+{
+	struct mpam_class *class = res->class;
+	struct mpam_props *cprops = &class->props;
+	struct rdt_resource *r = &res->resctrl_res;
+	bool has_mbwu = class_has_usable_mbwu(class);
+	bool has_csu = cache_has_usable_csu(class);
+
+	/* Is this one of the two well-known caches? */
+	switch (res->resctrl_res.rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		/* TODO: Scaling is not yet supported */
+		r->cache.cbm_len = class->props.cpbm_wd;
+		r->cache.arch_has_sparse_bitmasks = true;
+
+		/* mpam_devices will reject empty bitmaps */
+		r->cache.min_cbm_bits = mpam_min_cbm_bits(res->resctrl_res.rid);
+
+		/* TODO: kill these properties off as they are derivatives */
+		r->format_str = "%d=%0*x";
+		r->schema_fmt = RESCTRL_SCHEMA_BITMAP;
+		r->fflags = RFTYPE_RES_CACHE;
+		r->default_ctrl = BIT_MASK(class->props.cpbm_wd) - 1;
+		r->data_width = (class->props.cpbm_wd + 3) / 4;
+		r->cache_level = class->level;
+
+		/*
+		 * Which bits are shared with other ...things...
+		 * Unknown devices use partid-0 which uses all the bitmap
+		 * fields. Until we configured the SMMU and GIC not to do this
+		 * 'all the bits' is the correct answer here.
+		 */
+		r->cache.shareable_bits = r->default_ctrl;
+
+		if (mpam_has_feature(mpam_feat_cpor_part, cprops)) {
+			r->alloc_capable = true;
+			exposed_alloc_capable = true;
+		}
+
+		/*
+		 * MBWU counters may be 'local' or 'total' depending on where
+		 * they are in the topology. Counters on caches are assumed to
+		 * be local. If it's on the memory controller, its assumed to
+		 * be global.
+		 */
+		if (has_mbwu) {
+			if (class->level == 3) {
+				mbm_local_class = class;
+				r->mon_capable = true;
+
+			} else if (class->level == 2) {
+				mbm_core_class = class;
+				r->mon_capable = true;
+			}
+		}
+
+		/*
+		 * CSU counters only make sense on a cache. The file is called
+		 * llc_occupancy, but its expected to the on the L3.
+		 */
+		if (has_csu && class->type == MPAM_CLASS_CACHE)
+			r->mon_capable = true;
+
+		/*
+		 * The power domain of L2 cache msc is shared with the
+		 * core's, which will cause information of the L2 msc to
+		 * be lost when the core enter power down state.
+		 */
+		if (class->level <= 2)
+			r->is_volatile = true;
+		break;
+
+	case RDT_RESOURCE_MBA:
+		/* TODO: kill these properties off as they are derivatives */
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_MB;
+		r->default_ctrl = MAX_MBA_BW;
+		r->membw.max_bw = MAX_MBA_BW;
+		r->data_width = 3;
+
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.min_bw = 1;
+		r->membw.bw_gran = get_mba_granularity(cprops);
+
+		/* Round up to at least 1% */
+		if (!r->membw.bw_gran)
+			r->membw.bw_gran = 1;
+
+		if (class_has_usable_mba(cprops)) {
+			r->alloc_capable = true;
+			exposed_alloc_capable = true;
+		}
+
+		if (has_mbwu && class->type == MPAM_CLASS_MEMORY) {
+			mbm_total_class = class;
+			r->mon_capable = true;
+		}
+		break;
+
+	case RDT_RESOURCE_L3_MAX:
+	case RDT_RESOURCE_L2_MAX:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_CACHE;
+		r->default_ctrl = MAX_MBA_BW;
+		r->membw.max_bw = MAX_MBA_BW;
+		r->data_width = 3;
+		r->cache_level = class->level;
+
+		if (cache_has_usable_cmax(class))
+			r->alloc_capable = true;
+
+		r->membw.min_bw = 1;
+		r->membw.bw_gran = max(100 / (1 << cprops->cmax_wd), 1);
+		mpam_llc_gran_hisi_workaround(r);
+		break;
+
+	case RDT_RESOURCE_L3_MIN:
+	case RDT_RESOURCE_L2_MIN:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_CACHE;
+		r->default_ctrl = 0;
+		r->membw.max_bw = MAX_MBA_BW;
+		r->data_width = 3;
+		r->cache_level = class->level;
+
+		if (cache_has_usable_cmin(class))
+			r->alloc_capable = true;
+
+		r->membw.min_bw = 0;
+		r->membw.bw_gran = max(100 / (1 << cprops->cmax_wd), 1);
+		mpam_llc_gran_hisi_workaround(r);
+		break;
+
+	case RDT_RESOURCE_MB_MIN:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_MB;
+		r->default_ctrl = 0;
+		r->membw.max_bw = MAX_MBA_BW;
+		r->data_width = 3;
+
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.bw_gran = get_mba_granularity(cprops);
+
+		/* Round up to at least 1% */
+		if (!r->membw.bw_gran)
+			r->membw.bw_gran = 1;
+
+		if (class_has_usable_mbw_min(cprops))
+			r->alloc_capable = true;
+		break;
+
+	case RDT_RESOURCE_L3_PRI:
+	case RDT_RESOURCE_L2_PRI:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_CACHE;
+		r->default_ctrl = 0;
+		r->membw.max_bw = GENMASK(cprops->intpri_wd - 1, 0);
+		r->data_width = 3;
+		r->cache_level = class->level;
+
+		if (class_has_usable_intpri(cprops))
+			r->alloc_capable = true;
+
+		r->membw.min_bw = 0;
+		r->membw.bw_gran = 1;
+		break;
+
+	case RDT_RESOURCE_MB_PRI:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_MB;
+		r->default_ctrl = 3;
+		r->membw.max_bw = GENMASK(cprops->intpri_wd - 1, 0);
+		r->data_width = 3;
+
+		r->membw.bw_gran = 1;
+
+		if (class_has_usable_intpri(cprops))
+			r->alloc_capable = true;
+		break;
+
+	case RDT_RESOURCE_MB_HDL:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_MB;
+		r->default_ctrl = 1;
+		r->membw.max_bw = 1;
+		r->data_width = 1;
+
+		r->membw.bw_gran = 1;
+
+		if (class_has_usable_max_limit(cprops))
+			r->alloc_capable = true;
+		break;
+
+	case RDT_RESOURCE_MB_OPT:
+		r->format_str = "%d=%0*u";
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->fflags = RFTYPE_RES_MB;
+		r->default_ctrl = GENMASK(cprops->bwa_wd - 1, 0);
+		r->membw.max_bw = GENMASK(cprops->bwa_wd - 1, 0);
+		r->data_width = 5;
+
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.min_bw = 1;
+		r->membw.bw_gran = 1;
+
+		if (class_has_usable_mba(cprops))
+			r->alloc_capable = true;
+		break;
+
+	default:
+		break;
+	}
+
+	if (r->mon_capable) {
+		exposed_mon_capable = true;
+
+		/*
+		 * Unfortunately, num_rmid doesn't mean anything for
+		 * mpam, and its exposed to user-space!
+		 * num-rmid is supposed to mean the number of groups
+		 * that can be created, both control or monitor groups.
+		 * For mpam, each control group has its own pmg/rmid
+		 * space.
+		 */
+		r->num_rmid = resctrl_arch_system_num_rmid_idx();
+	}
+
+	return 0;
+}
+
+static int reqpartid_init(void)
+{
+	int req_num, idx;
+
+	req_num = get_num_reqpartid();
+	reqpartid_map = kcalloc(req_num, sizeof(u32), GFP_KERNEL);
+	if (!reqpartid_map)
+		return -ENOMEM;
+
+	for (idx = 0; idx < req_num; idx++)
+		reqpartid_map[idx] = idx;
+
+	return 0;
+}
+
+void reqpartid_exit(void)
+{
+	kfree(reqpartid_map);
+}
+
+void update_rmid_entries_for_reqpartid(u32 reqpartid)
+{
+	int pmg;
+	u32 intpartid = reqpartid_map[reqpartid];
+	u32 closid = partid2closid(intpartid);
+
+	for (pmg = 0; pmg <= mpam_pmg_max; pmg++)
+		rmid_entry_reassign_closid(closid, req_pmg2rmid(reqpartid, pmg));
+}
+
+static int mpam_sync_config(u32 reqpartid)
+{
+	struct mpam_component *comp;
+	struct mpam_class *class;
+	int err, idx;
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		list_for_each_entry(comp, &class->components, class_list) {
+			err = mpam_apply_config(comp, reqpartid, NULL, true);
+			if (err)
+				return err;
+		}
+	}
+	srcu_read_unlock(&mpam_srcu, idx);
+
+	return 0;
+}
+
+int resctrl_arch_rmid_expand(u32 closid)
+{
+	int i;
+
+	for (i = resctrl_arch_get_num_closid(NULL);
+	     i < get_num_reqpartid(); i++) {
+		if (reqpartid_map[i] >= resctrl_arch_get_num_closid(NULL)) {
+			if (cdp_enabled) {
+				reqpartid_map[i] = resctrl_get_config_index(closid, CDP_DATA);
+				mpam_sync_config(i);
+
+				reqpartid_map[i + 1] = resctrl_get_config_index(closid, CDP_CODE);
+				mpam_sync_config(i + 1);
+
+			} else {
+				reqpartid_map[i] = resctrl_get_config_index(closid, CDP_NONE);
+				mpam_sync_config(i);
+			}
+
+			update_rmid_entries_for_reqpartid(i);
+			return i;
+		}
+	}
+
+	return -ENOSPC;
+}
+
+void resctrl_arch_rmid_reclaim(u32 closid, u32 rmid)
+{
+	int pmg;
+	u32 intpartid;
+	int reqpartid = rmid2reqpartid(rmid);
+
+	if (reqpartid < resctrl_arch_get_num_closid(NULL))
+		return;
+
+	if (cdp_enabled)
+		intpartid = resctrl_get_config_index(closid, CDP_DATA);
+	else
+		intpartid = resctrl_get_config_index(closid, CDP_NONE);
+
+	WARN_ON_ONCE(intpartid != req2intpartid(reqpartid));
+
+	for (pmg = 0; pmg <= mpam_pmg_max; pmg++) {
+		if (rmid_is_occupied(closid, req_pmg2rmid(reqpartid, pmg)))
+			break;
+	}
+
+	if (pmg > mpam_pmg_max) {
+		reqpartid_map[reqpartid] = reqpartid;
+		if (cdp_enabled)
+			reqpartid_map[reqpartid + 1] = reqpartid + 1;
+
+		update_rmid_entries_for_reqpartid(reqpartid);
+	}
+}
+
+int mpam_resctrl_setup(void)
+{
+	int err = 0;
+	struct mpam_resctrl_res *res;
+	enum resctrl_res_level i;
+
+	wait_event(wait_cacheinfo_ready, cacheinfo_ready);
+
+	cpus_read_lock();
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+		INIT_LIST_HEAD(&res->resctrl_res.domains);
+		INIT_LIST_HEAD(&res->resctrl_res.evt_list);
+		res->resctrl_res.rid = i;
+	}
+
+	mpam_resctrl_pick_caches();
+	mpam_resctrl_pick_mba();
+	mpam_resctrl_pick_counters();
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+		if (!res->class)
+			continue;	// dummy resource
+
+		err = mpam_resctrl_resource_init(res);
+		if (err)
+			break;
+	}
+	cpus_read_unlock();
+
+	if (err)
+		return err;
+
+	if (!exposed_alloc_capable && !exposed_mon_capable)
+		return -EOPNOTSUPP;
+
+	err = reqpartid_init();
+	if (err)
+		return err;
+
+	if (!is_power_of_2(mpam_pmg_max + 1)) {
+		/*
+		 * If not all the partid*pmg values are valid indexes,
+		 * resctrl may allocate pmg that don't exist. This
+		 * should cause an error interrupt.
+		 */
+		pr_warn("Number of PMG is not a power of 2! resctrl may misbehave");
+	}
+
+	err = resctrl_init();
+	if (err)
+		goto out;
+
+	WRITE_ONCE(resctrl_enabled, true);
+
+	return 0;
+
+out:
+	reqpartid_exit();
+	return err;
+}
+
+void mpam_resctrl_exit(void)
+{
+	if (!READ_ONCE(resctrl_enabled))
+		return;
+
+	WRITE_ONCE(resctrl_enabled, false);
+	resctrl_exit();
+	reqpartid_exit();
+}
+
+u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
+			    u32 closid, enum resctrl_conf_type type)
+{
+	u32 partid;
+	struct mpam_config *cfg;
+	struct mpam_props *cprops;
+	struct mpam_resctrl_res *res;
+	struct mpam_resctrl_dom *dom;
+	enum mpam_device_features configured_by;
+
+	lockdep_assert_cpus_held();
+
+	if (!mpam_is_enabled())
+		return r->default_ctrl;
+
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+	cprops = &res->class->props;
+
+	/*
+	 * For resources that don't support CDP, both CDP_CODE and
+	 * CDP_DATA map to the same configuration.
+	 */
+	if (mpam_resctrl_hide_cdp(r->rid))
+		type = CDP_DATA;
+
+	partid = resctrl_get_config_index(closid, type);
+	cfg = &dom->comp->cfg[partid];
+
+	switch (r->rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		configured_by = mpam_feat_cpor_part;
+		break;
+	case RDT_RESOURCE_L2_MAX:
+	case RDT_RESOURCE_L3_MAX:
+		configured_by = mpam_feat_ccap_part;
+		break;
+	case RDT_RESOURCE_L2_MIN:
+	case RDT_RESOURCE_L3_MIN:
+		configured_by = mpam_feat_cmin;
+		break;
+	case RDT_RESOURCE_L2_PRI:
+	case RDT_RESOURCE_L3_PRI:
+	case RDT_RESOURCE_MB_PRI:
+		configured_by = mpam_feat_intpri_part;
+		break;
+
+	case RDT_RESOURCE_MBA:
+		if (mba_class_use_mbw_part(cprops)) {
+			configured_by = mpam_feat_mbw_part;
+			break;
+		} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+			configured_by = mpam_feat_mbw_max;
+			break;
+		}
+		return -EINVAL;
+
+	case RDT_RESOURCE_MB_MIN:
+		configured_by = mpam_feat_mbw_min;
+		break;
+
+	case RDT_RESOURCE_MB_HDL:
+		configured_by = mpam_feat_max_limit;
+		break;
+
+	case RDT_RESOURCE_MB_OPT:
+		configured_by = mpam_feat_mbw_max;
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	if (!r->alloc_capable || partid >= resctrl_arch_get_num_closid(r) ||
+	    !mpam_has_feature(configured_by, cfg))
+		return r->default_ctrl;
+
+	switch (configured_by) {
+	case mpam_feat_cpor_part:
+		/* TODO: Scaling is not yet supported */
+		return cfg->cpbm;
+	case mpam_feat_ccap_part:
+		return ca_max_to_percent(cfg->cmax, cprops->cmax_wd);
+	case mpam_feat_cmin:
+		return ca_max_to_percent(cfg->cmin, cprops->cmax_wd);
+	case mpam_feat_intpri_part:
+		return cfg->intpri;
+	case mpam_feat_mbw_part:
+		/* TODO: Scaling is not yet supported */
+		return mbw_pbm_to_percent(cfg->mbw_pbm, cprops);
+	case mpam_feat_mbw_max:
+		if (r->rid == RDT_RESOURCE_MBA)
+			return mbw_max_to_percent(cfg->mbw_max, cprops->bwa_wd);
+		else if (r->rid == RDT_RESOURCE_MB_OPT)
+			return cfg->mbw_max >> (16 - cprops->bwa_wd);
+		break;
+	case mpam_feat_mbw_min:
+		return mbw_max_to_percent(cfg->mbw_min, cprops->bwa_wd);
+	case mpam_feat_max_limit:
+		return cfg->max_limit;
+	default:
+		break;
+	}
+
+	return -EINVAL;
+}
+
+int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
+			    u32 closid, enum resctrl_conf_type t, u32 cfg_val)
+{
+	int err;
+	u32 partid;
+	struct mpam_config cfg;
+	struct mpam_props *cprops;
+	struct mpam_resctrl_res *res;
+	struct mpam_resctrl_dom *dom;
+
+	lockdep_assert_cpus_held();
+	lockdep_assert_irqs_enabled();
+
+	/* NOTE: don't check the CPU as mpam_apply_config() doesn't care,
+	 * and resctrl_arch_update_domains() depends on this. */
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+	cprops = &res->class->props;
+
+	if (mpam_resctrl_hide_cdp(r->rid))
+		t = CDP_DATA;
+
+	partid = resctrl_get_config_index(closid, t);
+	if (!r->alloc_capable || partid >= resctrl_arch_get_num_closid(r))
+		return -EINVAL;
+
+	cfg = dom->comp->cfg[partid];
+
+	switch (r->rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		if (mpam_cpbm_hisi_check_invalid(r, cfg_val))
+			return -EINVAL;
+
+		/* TODO: Scaling is not yet supported */
+		cfg.cpbm = cfg_val;
+		mpam_set_feature(mpam_feat_cpor_part, &cfg);
+		break;
+	case RDT_RESOURCE_L2_MAX:
+	case RDT_RESOURCE_L3_MAX:
+		cfg.cmax = percent_to_ca_max(cfg_val, cprops->cmax_wd);
+		mpam_set_feature(mpam_feat_ccap_part, &cfg);
+		break;
+	case RDT_RESOURCE_L2_MIN:
+	case RDT_RESOURCE_L3_MIN:
+		cfg.cmin = percent_to_ca_max(cfg_val, cprops->cmax_wd);
+		mpam_set_feature(mpam_feat_cmin, &cfg);
+		break;
+	case RDT_RESOURCE_L2_PRI:
+	case RDT_RESOURCE_L3_PRI:
+	case RDT_RESOURCE_MB_PRI:
+		cfg.intpri = cfg_val;
+		mpam_set_feature(mpam_feat_intpri_part, &cfg);
+		break;
+	case RDT_RESOURCE_MBA:
+		if (mba_class_use_mbw_part(cprops)) {
+			cfg.mbw_pbm = percent_to_mbw_pbm(cfg_val, cprops);
+			mpam_set_feature(mpam_feat_mbw_part, &cfg);
+			break;
+		} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+			cfg.mbw_max = percent_to_mbw_max(cfg_val, cprops->bwa_wd);
+			mpam_set_feature(mpam_feat_mbw_max, &cfg);
+			break;
+		}
+		return -EINVAL;
+	case RDT_RESOURCE_MB_MIN:
+		cfg.mbw_min = percent_to_mbw_max(cfg_val, cprops->bwa_wd);
+		mpam_set_feature(mpam_feat_mbw_min, &cfg);
+		break;
+	case RDT_RESOURCE_MB_HDL:
+		cfg.max_limit = cfg_val;
+		mpam_set_feature(mpam_feat_max_limit, &cfg);
+		break;
+	case RDT_RESOURCE_MB_OPT:
+		cfg.mbw_max = cfg_val << (16 - cprops->bwa_wd);
+		mpam_set_feature(mpam_feat_mbw_max, &cfg);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/*
+	 * When CDP is enabled, but the resource doesn't support it, we need to
+	 * apply the same configuration to the other partid.
+	 */
+	if (mpam_resctrl_hide_cdp(r->rid)) {
+		partid = resctrl_get_config_index(closid, CDP_CODE);
+		err = mpam_apply_config(dom->comp, partid, &cfg, false);
+		if (err)
+			return err;
+
+		partid = resctrl_get_config_index(closid, CDP_DATA);
+		return mpam_apply_config(dom->comp, partid, &cfg, false);
+
+	} else {
+		return mpam_apply_config(dom->comp, partid, &cfg, false);
+	}
+}
+
+/* TODO: this is IPI heavy */
+int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid)
+{
+	int err = 0;
+	struct rdt_domain *d;
+	enum resctrl_conf_type t;
+	struct resctrl_staged_config *cfg;
+
+	lockdep_assert_cpus_held();
+	lockdep_assert_irqs_enabled();
+
+	list_for_each_entry(d, &r->domains, list) {
+		for (t = 0; t < CDP_NUM_TYPES; t++) {
+			cfg = &d->staged_config[t];
+			if (!cfg->have_new_ctrl)
+				continue;
+
+			err = resctrl_arch_update_one(r, d, closid, t,
+						      cfg->new_ctrl);
+			if (err)
+				return err;
+		}
+	}
+
+	return err;
+}
+
+void resctrl_arch_reset_resources(void)
+{
+	int i, idx;
+	struct mpam_class *class;
+	struct mpam_resctrl_res *res;
+
+	lockdep_assert_cpus_held();
+
+	if (!mpam_is_enabled())
+		return;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+
+		if (!res->class)
+			continue;	// dummy resource
+
+		if (!res->resctrl_res.alloc_capable)
+			continue;
+
+		idx = srcu_read_lock(&mpam_srcu);
+		list_for_each_entry_rcu(class, &mpam_classes, classes_list)
+			mpam_reset_class(class);
+		srcu_read_unlock(&mpam_srcu, idx);
+	}
+}
+
+static struct mpam_resctrl_dom *
+mpam_resctrl_alloc_domain(unsigned int cpu, struct mpam_resctrl_res *res)
+{
+	struct mpam_resctrl_dom *dom;
+	struct mpam_class *class = res->class;
+	struct mpam_component *comp_iter, *comp;
+
+	comp = NULL;
+	list_for_each_entry(comp_iter, &class->components, class_list) {
+		if (cpumask_test_cpu(cpu, &comp_iter->affinity)) {
+			comp = comp_iter;
+			break;
+		}
+	}
+
+	/* cpu with unknown exported component? */
+	if (WARN_ON_ONCE(!comp))
+		return ERR_PTR(-EINVAL);
+
+	dom = kzalloc_node(sizeof(*dom), GFP_KERNEL, cpu_to_node(cpu));
+	if (!dom)
+		return ERR_PTR(-ENOMEM);
+
+	dom->comp = comp;
+	INIT_LIST_HEAD(&dom->resctrl_dom.list);
+	dom->resctrl_dom.id = comp->comp_id;
+	dom->mbm_local_evt_cfg = MPAM_RESTRL_EVT_CONFIG_VALID;
+	cpumask_set_cpu(cpu, &dom->resctrl_dom.cpu_mask);
+
+	/* TODO: this list should be sorted */
+	list_add_tail(&dom->resctrl_dom.list, &res->resctrl_res.domains);
+	dom->resctrl_dom.res = &res->resctrl_res;
+
+	return dom;
+}
+
+/* Like resctrl_get_domain_from_cpu(), but for offline CPUs */
+static struct mpam_resctrl_dom *
+mpam_get_domain_from_cpu(int cpu, struct mpam_resctrl_res *res)
+{
+	struct rdt_domain *d;
+	struct mpam_resctrl_dom *dom;
+
+	lockdep_assert_cpus_held();
+
+	list_for_each_entry(d, &res->resctrl_res.domains, list) {
+		dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+
+		if (cpumask_test_cpu(cpu, &dom->comp->affinity))
+			return dom;
+	}
+
+	return NULL;
+}
+
+struct rdt_domain *resctrl_arch_find_domain(struct rdt_resource *r, int id)
+{
+	struct rdt_domain *d;
+	struct mpam_resctrl_dom *dom;
+
+	lockdep_assert_cpus_held();
+
+	list_for_each_entry(d, &r->domains, list) {
+		dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+		if (dom->comp->comp_id == id)
+			return &dom->resctrl_dom;
+	}
+
+	return NULL;
+}
+
+int mpam_resctrl_online_cpu(unsigned int cpu)
+{
+	int i, err;
+	struct mpam_resctrl_dom *dom;
+	struct mpam_resctrl_res *res;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+
+		if (!res->class)
+			continue;	// dummy_resource;
+
+		dom = mpam_get_domain_from_cpu(cpu, res);
+		if (dom) {
+			cpumask_set_cpu(cpu, &dom->resctrl_dom.cpu_mask);
+			continue;
+		}
+
+		dom = mpam_resctrl_alloc_domain(cpu, res);
+		if (IS_ERR(dom))
+			return PTR_ERR(dom);
+		err = resctrl_online_domain(&res->resctrl_res, &dom->resctrl_dom);
+		if (err)
+			return err;
+	}
+
+	resctrl_online_cpu(cpu);
+	return 0;
+}
+
+int mpam_resctrl_prepare_offline(void)
+{
+	struct mpam_resctrl_res *res;
+	int i;
+
+	if (resctrl_mounted) {
+		for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+			res = &mpam_resctrl_exports[i];
+
+			if (res->resctrl_res.is_volatile &&
+			   !res->resctrl_res.invisible) {
+				pr_info("%s is working, umount /sys/fs/resctrl first.\n",
+					res->resctrl_res.name);
+				return -EBUSY;
+			}
+		}
+	}
+
+	return 0;
+}
+
+int mpam_resctrl_offline_cpu(unsigned int cpu)
+{
+	int i;
+	struct rdt_domain *d;
+	struct mpam_resctrl_res *res;
+	struct mpam_resctrl_dom *dom;
+
+	resctrl_offline_cpu(cpu);
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &mpam_resctrl_exports[i];
+
+		if (!res->class)
+			continue;	// dummy resource
+
+		d = resctrl_get_domain_from_cpu(cpu, &res->resctrl_res);
+		dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+
+		/* The last one standing was ahead of us... */
+		if (WARN_ON_ONCE(!d))
+			continue;
+
+		cpumask_clear_cpu(cpu, &d->cpu_mask);
+
+		if (!cpumask_empty(&d->cpu_mask))
+			continue;
+
+		resctrl_offline_domain(&res->resctrl_res, &dom->resctrl_dom);
+		list_del(&d->list);
+		kfree(dom);
+	}
+
+	return 0;
+}
+
+static struct mon_evt llc_occupancy_event = {
+	.name		= "llc_occupancy",
+	.evtid		= QOS_L3_OCCUP_EVENT_ID,
+};
+
+static struct mon_evt l2c_occupancy_event = {
+	.name		= "l2c_occupancy",
+	.evtid		= QOS_L2_OCCUP_EVENT_ID,
+};
+
+static struct mon_evt mbm_total_event = {
+	.name		= "mbm_total_bytes",
+	.evtid		= QOS_L3_MBM_TOTAL_EVENT_ID,
+};
+
+static struct mon_evt mbm_local_event = {
+	.name		= "mbm_local_bytes",
+	.evtid		= QOS_L3_MBM_LOCAL_EVENT_ID,
+};
+
+static struct mon_evt mbm_core_event = {
+	.name		= "mbm_core_bytes",
+	.evtid		= QOS_L2_MBM_CORE_EVENT_ID,
+};
+
+/*
+ * Initialize the event list for the resource.
+ *
+ * Note that MBM events are also part of RDT_RESOURCE_L3 resource
+ * because as per the SDM the total and local memory bandwidth
+ * are enumerated as part of L3 monitoring.
+ */
+static void l3_mon_evt_init(struct rdt_resource *r)
+{
+	INIT_LIST_HEAD(&r->evt_list);
+
+	if (!r->mon_capable)
+		return;
+
+	if (r->rid == RDT_RESOURCE_L3) {
+		if (resctrl_arch_is_llc_occupancy_enabled())
+			list_add_tail(&llc_occupancy_event.list, &r->evt_list);
+
+		if (resctrl_arch_is_mbm_local_enabled())
+			list_add_tail(&mbm_local_event.list, &r->evt_list);
+	}
+
+	if (r->rid == RDT_RESOURCE_L2) {
+		if (resctrl_arch_is_l2c_occupancy_enabled())
+			list_add_tail(&l2c_occupancy_event.list, &r->evt_list);
+
+		if (resctrl_arch_is_mbm_core_enabled())
+			list_add_tail(&mbm_core_event.list, &r->evt_list);
+	}
+
+	if ((r->rid == RDT_RESOURCE_MBA) &&
+	     resctrl_arch_is_mbm_total_enabled())
+		list_add_tail(&mbm_total_event.list, &r->evt_list);
+}
+
+int resctrl_arch_mon_resource_init(void)
+{
+	l3_mon_evt_init(resctrl_arch_get_resource(RDT_RESOURCE_L3));
+	l3_mon_evt_init(resctrl_arch_get_resource(RDT_RESOURCE_L2));
+	l3_mon_evt_init(resctrl_arch_get_resource(RDT_RESOURCE_MBA));
+
+	if (resctrl_arch_is_evt_configurable(QOS_L3_MBM_TOTAL_EVENT_ID)) {
+		mbm_total_event.configurable = true;
+		mbm_config_rftype_init("mbm_total_bytes_config");
+	}
+	if (resctrl_arch_is_evt_configurable(QOS_L3_MBM_LOCAL_EVENT_ID)) {
+		mbm_local_event.configurable = true;
+		mbm_config_rftype_init("mbm_local_bytes_config");
+	}
+
+	return 0;
+}
+
+static int __init __cacheinfo_ready(void)
+{
+	cacheinfo_ready = true;
+	wake_up(&wait_cacheinfo_ready);
+
+	return 0;
+}
+device_initcall_sync(__cacheinfo_ready);

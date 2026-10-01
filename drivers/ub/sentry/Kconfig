@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config UB_SENTRY
+    tristate "sentry message report"
+    depends on UB && ACPI_POWER_NOTIFIER_CHAIN
+    default m
+    help
+      Listens to kernel event(eg. oom) and send sentry msg to userspace
+      Provides device for userspace to read kernel message and reply ack
+      Provides kernel api to send message to userspace and wait for result
+
+config UB_SENTRY_REMOTE
+    tristate "sentry remote event reporter module"
+    depends on UB_SENTRY && UB_URMA
+    default m
+    help
+      report panic/reboot event msg

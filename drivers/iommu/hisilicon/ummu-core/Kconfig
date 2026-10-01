@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0+
+
+config UB_UMMU_CORE
+	bool "UMMU Framework Builtin API"
+	depends on ARM64
+	help
+	  Enable the UMMU framework and configure this config, as the kernel
+	  provides the basic functionality for using UB features. This config
+	  is built-in by default if you are using UB features.
+	  Say 'Y' here if you are using UB.
+
+if UB_UMMU_CORE
+config UB_UMMU_CORE_DRIVER
+	tristate "UMMU Framework Modular API"
+	depends on UB_UBUS
+	help
+	  The configuration is flexible and depends on how the ummu driver
+	  intends to utilize this feature. This configuration option
+	  encompasses various features that the driver may use.
+	  If the driver wishes to employ the UB feature, this
+	  configuration must be enabled.
+	  Select 'M' to build these features as a loadable kernel module.
+
+config UB_UMMU_SVA_SEPARATED_PAGES
+	bool "Support for UMMU SVA to establish separated page tables"
+	help
+	  The hardware does not support IOPF capability, using SVA
+	  armed page tables can lead to page faults due to periodic
+	  memory tasks. By separating the process page table from the
+	  MMU page table, the goal of SVA programming is achieved.
+	  using SVA in this scenario say 'Y' here.
+endif
