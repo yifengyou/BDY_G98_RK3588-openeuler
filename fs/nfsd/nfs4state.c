@@ -6322,7 +6322,6 @@ nfs4_laundromat(struct nfsd_net *nn)
 		.new_timeo = nn->nfsd4_lease
 	};
 	struct nfs4_cpntf_state *cps;
-	struct nfs4_client *clp;
 	copy_stateid_t *cps_t;
 	int i;
 
