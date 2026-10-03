@@ -1314,23 +1314,12 @@ static void rk_iommu_shutdown(struct platform_device *pdev)
 
 static int __maybe_unused rk_iommu_suspend(struct device *dev)
 {
-	struct rk_iommu *iommu = dev_get_drvdata(dev);
-
-	if (iommu->domain == &rk_identity_domain)
-		return 0;
-
-	rk_iommu_disable(iommu);
 	return 0;
 }
 
 static int __maybe_unused rk_iommu_resume(struct device *dev)
 {
-	struct rk_iommu *iommu = dev_get_drvdata(dev);
-
-	if (iommu->domain == &rk_identity_domain)
-		return 0;
-
-	return rk_iommu_enable(iommu);
+	return 0;
 }
 
 static const struct dev_pm_ops rk_iommu_pm_ops = {
