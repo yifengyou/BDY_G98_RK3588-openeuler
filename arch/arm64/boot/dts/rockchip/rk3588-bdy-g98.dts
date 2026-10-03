@@ -137,16 +137,6 @@
 		compatible = "gpio-leds";
 		status = "okay";
 
-		hdd-led {
-			default-state = "off";
-			gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
-		};
-
-		net-led {
-			default-state = "off";
-			gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_HIGH>;
-		};
-
 		work-led {
 			gpios = <&gpio3 RK_PB7 GPIO_ACTIVE_HIGH>;
 			linux,default-trigger = "heartbeat";
@@ -813,11 +803,6 @@
 
 /* ===== RGA (2D accelerator) ===== */
 &rga {
-	compatible = "rockchip,rk3588-rga", "rockchip,rk3288-rga";
-	reg = <0x0 0xfdb80000 0x0 0x180>;
-	/delete-property/ interrupt-names;
-	clocks = <&cru ACLK_RGA2>, <&cru HCLK_RGA2>, <&cru CLK_RGA2_CORE>;
-	clock-names = "aclk", "hclk", "sclk";
 	status = "okay";
 };
 
