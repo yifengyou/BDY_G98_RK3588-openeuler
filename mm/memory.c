@@ -6671,7 +6671,7 @@ int __access_remote_vm(struct mm_struct *mm, unsigned long addr, void *buf,
 				if (!ret)
 					set_page_dirty_lock(page);
 			} else {
-				ret = copy_mc_from_user_page(vma, page, addr,
+				ret = (int)(unsigned long)copy_mc_from_user_page(vma, page, addr,
 						    buf, maddr + offset, bytes);
 			}
 			kunmap(page);

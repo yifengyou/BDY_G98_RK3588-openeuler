@@ -662,6 +662,7 @@
 #define HCLK_PMU_CM0_ROOT		647
 #define PCLK_PMU1			648
 #define CLK_DDR_FAIL_SAFE		649
+#define ACLK_VOP_DIV2_SRC		650
 #define CLK_PMU1			650
 #define HCLK_PDM0			651
 #define MCLK_PDM0			652
