@@ -5,6 +5,8 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -36,6 +38,9 @@
 
 #define RK3588_GRF_SOC_STATUS0		0x600
 #define RK3588_PHYREF_ALT_GATE		0xc38
+
+#define GRF_BIT(nr)	(BIT(nr) | BIT(nr+16))
+#define GRF_CLR_BIT(nr)	(BIT(nr+16))
 
 enum rk3588_plls {
 	b0pll, b1pll, lpll, v0pll, aupll, cpll, gpll, npll, ppll,
@@ -2459,6 +2464,79 @@ static void __init rk3588_clk_init(struct device_node *np)
 {
 	struct rockchip_clk_provider *ctx;
 	void __iomem *reg_base;
+	void __iomem *sys_grf, *php_grf;
+	void __iomem *gpio3, *gpio4;
+	u32 dat;
+
+	/* Early GMAC GRF and switch reset: On this board the GMAC DMA
+	 * SFT_RESET bit starts as 1 at kernel boot and only clears after
+	 * the RGMII interface is configured and the YT9215 switch outputs
+	 * a receive clock.  Configure the GRF to RGMII mode and reset the
+	 * switches here so that by the time the stmmac driver opens the
+	 * interface the DMA can be reset successfully.
+	 *
+	 * sys_grf  @ 0xfd58c000   php_grf  @ 0xfd5b0000
+	 * GMAC0 reset gpio: GPIO4 (0xfec50000) pin 11, active-low
+	 * GMAC1 reset gpio: GPIO3 (0xfec40000) pin 24, active-low
+	 */
+
+	php_grf = ioremap(0xfd5b0000, 0x1000);
+	if (php_grf) {
+		/* PHY interface select: RGMII for both GMAC0 and GMAC1 */
+		writel(GRF_BIT(3) | GRF_CLR_BIT(4) | GRF_CLR_BIT(5) |
+		       GRF_BIT(9) | GRF_CLR_BIT(10) | GRF_CLR_BIT(11),
+		       php_grf + 0x08);
+
+		/* Clock mode: CRU clock, RGMII mode, no gate for both GMACs */
+		writel(GRF_BIT(4) | GRF_CLR_BIT(0) | GRF_CLR_BIT(1),
+		       php_grf + 0x70);
+		writel(GRF_BIT(9) | GRF_CLR_BIT(5) | GRF_CLR_BIT(6),
+		       php_grf + 0x70);
+
+		iounmap(php_grf);
+	}
+
+	sys_grf = ioremap(0xfd58c000, 0x1000);
+	if (sys_grf) {
+		/* Enable TX/RX clock delay for both GMACs */
+		writel(GRF_BIT(2) | GRF_BIT(3) | GRF_BIT(4) | GRF_BIT(5),
+		       sys_grf + 0x31c);
+
+		/* GMAC0 delay: TX=0x04 RX=0x04 */
+		writel(0x0404ffff, sys_grf + 0x320);
+
+		/* GMAC1 delay: TX=0x02 RX=0x04 */
+		writel(0x0402ffff, sys_grf + 0x324);
+
+		iounmap(sys_grf);
+	}
+
+	/* Reset YT9215 switches to start RGMII clock output */
+	gpio4 = ioremap(0xfec50000, 0x100);
+	if (gpio4) {
+		dat = readl(gpio4 + 0x0000);
+		writel(dat & ~BIT(11), gpio4 + 0x0000);
+		dat = readl(gpio4 + 0x0004);
+		writel(dat | BIT(11), gpio4 + 0x0004);
+		mdelay(20);
+		dat = readl(gpio4 + 0x0000);
+		writel(dat | BIT(11), gpio4 + 0x0000);
+		mdelay(100);
+		iounmap(gpio4);
+	}
+
+	gpio3 = ioremap(0xfec40000, 0x100);
+	if (gpio3) {
+		dat = readl(gpio3 + 0x0000);
+		writel(dat & ~BIT(24), gpio3 + 0x0000);
+		dat = readl(gpio3 + 0x0004);
+		writel(dat | BIT(24), gpio3 + 0x0004);
+		mdelay(20);
+		dat = readl(gpio3 + 0x0000);
+		writel(dat | BIT(24), gpio3 + 0x0000);
+		mdelay(100);
+		iounmap(gpio3);
+	}
 
 	reg_base = of_iomap(np, 0);
 	if (!reg_base) {
