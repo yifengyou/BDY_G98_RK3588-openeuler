@@ -160,6 +160,7 @@
 					 * protocol packets
 					 */
 #define ETH_P_UB	0x0100		/* Network control packet of Unified Bus */
+#define ETH_P_YT921X	0x9988		/* Motorcomm YT921x DSA [ NOT AN OFFICIALLY REGISTERED ID ] */
 
 /*
  *	This is an Ethernet frame header.
