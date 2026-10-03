@@ -635,6 +635,7 @@
 				label = "lan5";
 				phy-mode = "internal";
 				phy-handle = <&sw1phy1>;
+				local-mac-address = [00 00 5e 00 02 01];
 			};
 
 			ethernet-port@2 {
@@ -642,6 +643,7 @@
 				label = "lan6";
 				phy-mode = "internal";
 				phy-handle = <&sw1phy2>;
+				local-mac-address = [00 00 5e 00 02 02];
 			};
 
 			ethernet-port@3 {
@@ -649,6 +651,7 @@
 				label = "lan7";
 				phy-mode = "internal";
 				phy-handle = <&sw1phy3>;
+				local-mac-address = [00 00 5e 00 02 03];
 			};
 
 			ethernet-port@4 {
@@ -656,6 +659,7 @@
 				label = "lan8";
 				phy-mode = "internal";
 				phy-handle = <&sw1phy4>;
+				local-mac-address = [00 00 5e 00 02 04];
 			};
 
 			ethernet-port@9 {
@@ -701,6 +705,7 @@
 				label = "lan1";
 				phy-mode = "internal";
 				phy-handle = <&sw0phy1>;
+				local-mac-address = [00 00 5e 00 01 01];
 			};
 
 			ethernet-port@2 {
@@ -708,6 +713,7 @@
 				label = "lan2";
 				phy-mode = "internal";
 				phy-handle = <&sw0phy2>;
+				local-mac-address = [00 00 5e 00 01 02];
 			};
 
 			ethernet-port@3 {
@@ -715,6 +721,7 @@
 				label = "lan3";
 				phy-mode = "internal";
 				phy-handle = <&sw0phy3>;
+				local-mac-address = [00 00 5e 00 01 03];
 			};
 
 			ethernet-port@4 {
@@ -722,6 +729,7 @@
 				label = "lan4";
 				phy-mode = "internal";
 				phy-handle = <&sw0phy4>;
+				local-mac-address = [00 00 5e 00 01 04];
 			};
 
 			ethernet-port@9 {
