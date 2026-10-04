@@ -764,20 +764,15 @@
 
 /* ===== GPU (Mali-G610) ===== */
 &gpu {
-	compatible = "rockchip,rk3588-mali", "arm,mali-valhall-csf";
+	compatible = "arm,mali-valhall";
 	clocks = <&cru CLK_GPU>, <&cru CLK_GPU_COREGROUP>,
 		 <&cru CLK_GPU_STACKS>;
-	clock-names = "core", "coregroup", "stacks";
-	interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH 0>,
+	clock-names = "clk_mali", "clk_gpu_coregroup",
+		      "clk_gpu_stacks";
+	interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH 0>,
 		     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH 0>,
-		     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH 0>;
-	interrupt-names = "job", "mmu", "gpu";
-	/*
-	 * panthor registers only one OPP supply, so the default
-	 * gpu_opp_table_panthor (2 supplies, 6-cell opp-microvolt rows)
-	 * is rejected with -EINVAL and the probe fails. Point to the
-	 * single-supply table from rk3588-opp.dtsi instead.
-	 */
+		     <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupt-names = "GPU", "MMU", "JOB";
 	operating-points-v2 = <&gpu_opp_table>;
 	status = "okay";
 };

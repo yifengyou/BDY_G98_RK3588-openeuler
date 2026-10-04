@@ -31,18 +31,22 @@
 	};
 
 	gpu: gpu@fb000000 {
-		compatible = "rockchip,rk3588-mali", "arm,mali-valhall-csf";
+		compatible = "arm,mali-valhall";
 		reg = <0x0 0xfb000000 0x0 0x200000>;
-		interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH 0>,
+		interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH 0>,
 			     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH 0>,
-			     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH 0>;
-		interrupt-names = "job", "mmu", "gpu";
+			     <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "GPU", "MMU", "JOB";
 		clocks = <&cru CLK_GPU>, <&cru CLK_GPU_COREGROUP>,
 			 <&cru CLK_GPU_STACKS>;
-		clock-names = "core", "coregroup", "stacks";
+		clock-names = "clk_mali", "clk_gpu_coregroup",
+			      "clk_gpu_stacks";
 		power-domains = <&power RK3588_PD_GPU>;
-		operating-points-v2 = <&gpu_opp_table_panthor>;
+		operating-points-v2 = <&gpu_opp_table>;
 		#cooling-cells = <2>;
+		dynamic-power-coefficient = <2982>;
+		upthreshold = <30>;
+		downdifferential = <10>;
 		status = "disabled";
 	};
 

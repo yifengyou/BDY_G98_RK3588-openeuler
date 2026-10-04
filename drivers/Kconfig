@@ -214,6 +214,8 @@ source "drivers/hooks/Kconfig"
 
 source "drivers/gpu/trace/Kconfig"
 
+source "drivers/gpu/arm/Kconfig"
+
 source "drivers/nvdimm/Kconfig"
 
 source "drivers/dax/Kconfig"
