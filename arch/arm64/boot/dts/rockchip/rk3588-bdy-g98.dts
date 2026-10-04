@@ -764,16 +764,8 @@
 
 /* ===== GPU (Mali-G610) ===== */
 &gpu {
-	compatible = "arm,mali-valhall";
-	clocks = <&cru CLK_GPU>, <&cru CLK_GPU_COREGROUP>,
-		 <&cru CLK_GPU_STACKS>;
-	clock-names = "clk_mali", "clk_gpu_coregroup",
-		      "clk_gpu_stacks";
-	interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH 0>,
-		     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH 0>,
-		     <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH 0>;
-	interrupt-names = "GPU", "MMU", "JOB";
-	operating-points-v2 = <&gpu_opp_table>;
+	mali-supply = <&vdd_gpu_s0>;
+	mem-supply = <&vdd_gpu_mem_s0>;
 	status = "okay";
 };
 
