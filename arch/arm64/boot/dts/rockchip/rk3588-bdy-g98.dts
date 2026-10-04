@@ -731,6 +731,7 @@
 };
 
 &rknpu_mmu {
+	power-domains = <&power RK3588_PD_NPUTOP>;
 	status = "okay";
 };
 

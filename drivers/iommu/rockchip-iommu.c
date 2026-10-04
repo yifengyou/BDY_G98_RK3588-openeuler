@@ -113,6 +113,7 @@ struct rk_iommu {
 	struct iommu_device iommu;
 	struct list_head node; /* entry in rk_iommu_domain.iommus */
 	struct iommu_domain *domain; /* domain to which iommu is attached */
+	bool enabled;
 };
 
 struct rk_iommudata {
@@ -918,6 +919,8 @@ static void rk_iommu_disable(struct rk_iommu *iommu)
 	}
 	rk_iommu_disable_stall(iommu);
 	clk_bulk_disable(iommu->num_clocks, iommu->clocks);
+
+	iommu->enabled = false;
 }
 
 /* Must be called with iommu powered on and attached */
@@ -952,6 +955,8 @@ out_disable_stall:
 	rk_iommu_disable_stall(iommu);
 out_disable_clocks:
 	clk_bulk_disable(iommu->num_clocks, iommu->clocks);
+	if (!ret)
+		iommu->enabled = true;
 	return ret;
 }
 
@@ -1316,10 +1321,13 @@ static int __maybe_unused rk_iommu_suspend(struct device *dev)
 {
 	struct rk_iommu *iommu = dev_get_drvdata(dev);
 
-	if (!iommu || iommu->domain == &rk_identity_domain)
+	if (!iommu)
 		return 0;
 
-	rk_iommu_disable(iommu);
+	if (iommu->domain == &rk_identity_domain)
+		return 0;
+
+	iommu->enabled = false;
 	return 0;
 }
 
@@ -1327,7 +1335,10 @@ static int __maybe_unused rk_iommu_resume(struct device *dev)
 {
 	struct rk_iommu *iommu = dev_get_drvdata(dev);
 
-	if (!iommu || iommu->domain == &rk_identity_domain)
+	if (!iommu)
+		return 0;
+
+	if (iommu->domain == &rk_identity_domain)
 		return 0;
 
 	return rk_iommu_enable(iommu);
@@ -1392,7 +1403,7 @@ bool rockchip_iommu_is_enabled(struct device *dev)
 	if (!iommu)
 		return false;
 
-	return iommu->domain != &rk_identity_domain;
+	return iommu->enabled;
 }
 EXPORT_SYMBOL(rockchip_iommu_is_enabled);
 
