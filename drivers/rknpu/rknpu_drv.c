@@ -1068,7 +1068,7 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
 					 !val, NPU_MMU_DISABLED_POLL_PERIOD_US,
 					 NPU_MMU_DISABLED_POLL_TIMEOUT_US);
 		if (ret) {
-			LOG_DEV_ERROR(dev, "iommu still enabled\n");
+			LOG_DEV_DEBUG(dev, "iommu still enabled, skip power off\n");
 			pm_runtime_get_sync(dev);
 			rknpu_devfreq_unlock(rknpu_dev);
 			return ret;

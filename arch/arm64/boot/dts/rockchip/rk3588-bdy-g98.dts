@@ -434,11 +434,15 @@
 	supports-emmc;
 	non-removable;
 	mmc-hs200-1_8v;
-	status = "okay";
+	status = "disabled";
 };
 
 // sdmmc: mmc@fe2c0000
 &sdmmc {
+	status = "disabled";
+};
+
+&optee {
 	status = "disabled";
 };
 
@@ -734,17 +738,6 @@
 &gpu {
 	mali-supply = <&vdd_gpu_s0>;
 	status = "okay";
-};
-
-/*
- * rk3588s-vpu.dtsi adds rkvdec-sram@0/@78000 pools that fully overlap the
- * codec-sram@0/@78000 pools from rk3588-base.dtsi, so mmio-sram fails to
- * register them. Drop the duplicate rkvdec pools and let the rkvdec cores
- * share the codec pools instead.
- */
-&system_sram2 {
-	/delete-node/ rkvdec-sram@0;
-	/delete-node/ rkvdec-sram@78000;
 };
 
 &rkvdec0 {

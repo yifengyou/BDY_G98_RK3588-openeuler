@@ -1309,23 +1309,43 @@ static void rk_iommu_shutdown(struct platform_device *pdev)
 		devm_free_irq(iommu->dev, irq, iommu);
 	}
 
-	pm_runtime_force_suspend(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 }
 
 static int __maybe_unused rk_iommu_suspend(struct device *dev)
 {
+	struct rk_iommu *iommu = dev_get_drvdata(dev);
+
+	if (!iommu || iommu->domain == &rk_identity_domain)
+		return 0;
+
+	rk_iommu_disable(iommu);
 	return 0;
 }
 
 static int __maybe_unused rk_iommu_resume(struct device *dev)
+{
+	struct rk_iommu *iommu = dev_get_drvdata(dev);
+
+	if (!iommu || iommu->domain == &rk_identity_domain)
+		return 0;
+
+	return rk_iommu_enable(iommu);
+}
+
+static int __maybe_unused rk_iommu_sys_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int __maybe_unused rk_iommu_sys_resume(struct device *dev)
 {
 	return 0;
 }
 
 static const struct dev_pm_ops rk_iommu_pm_ops = {
 	SET_RUNTIME_PM_OPS(rk_iommu_suspend, rk_iommu_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(rk_iommu_sys_suspend, rk_iommu_sys_resume)
 };
 
 static struct rk_iommu_ops iommu_data_ops_v1 = {

@@ -171,10 +171,8 @@
 			     <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
 			     <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
 		interrupt-names = "npu0_mmu", "npu1_mmu", "npu2_mmu";
-		clocks = <&cru ACLK_NPU0>, <&cru ACLK_NPU1>, <&cru ACLK_NPU2>,
-			 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>;
-		clock-names = "aclk0", "aclk1", "aclk2",
-			      "iface0", "iface1", "iface2";
+		clocks = <&cru ACLK_NPU0>, <&cru HCLK_NPU0>;
+		clock-names = "aclk", "iface";
 		#iommu-cells = <0>;
 		status = "disabled";
 	};
@@ -182,23 +180,11 @@
 
 &system_sram2 {
 	vdec0_sram: codec-sram@0 {
-		pool;
 		reg = <0x0 0x78000>;
 	};
 
 	vdec1_sram: codec-sram@78000 {
-		pool;
-		reg = <0x78000 0x78000>;
-	};
-
-	rkvdec-sram@0 {
-		pool;
-		reg = <0x0 0x78000>;
-	};
-
-	rkvdec-sram@78000 {
-		pool;
-		reg = <0x78000 0x78000>;
+		reg = <0x78000 0x77000>;
 	};
 };
 

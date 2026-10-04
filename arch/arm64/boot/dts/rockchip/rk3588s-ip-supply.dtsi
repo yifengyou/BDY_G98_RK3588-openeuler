@@ -38,6 +38,9 @@
 	rknpu_core_opp_table: opp-table-3 {
 		compatible = "operating-points-v2";
 
+		nvmem-cells = <&npu_leakage>;
+		nvmem-cell-names = "leakage";
+
 		opp-300000000 {
 			opp-hz = /bits/ 64 <300000000>;
 			opp-microvolt = <600000>;
