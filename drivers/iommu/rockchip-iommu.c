@@ -1364,4 +1364,16 @@ static struct platform_driver rk_iommu_driver = {
 		   .suppress_bind_attrs = true,
 	},
 };
+bool rockchip_iommu_is_enabled(struct device *dev)
+{
+	struct rk_iommu *iommu;
+
+	iommu = rk_iommu_from_dev(dev);
+	if (!iommu)
+		return false;
+
+	return iommu->domain != &rk_identity_domain;
+}
+EXPORT_SYMBOL(rockchip_iommu_is_enabled);
+
 builtin_platform_driver(rk_iommu_driver);
