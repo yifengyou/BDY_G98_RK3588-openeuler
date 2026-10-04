@@ -4,6 +4,8 @@
 	gpu_opp_table: opp-table-1 {
 		compatible = "operating-points-v2";
 		rockchip,supported-hw;
+		nvmem-cells = <&gpu_leakage>;
+		nvmem-cell-names = "leakage";
 
 		opp-600000000 {
 			opp-supported-hw = <0xe9 0xffff>;
